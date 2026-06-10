@@ -188,23 +188,22 @@ fn task_vm(pid: c_int) -> Option<(u64, u64)> {
     Some((info.compressed, info.phys_footprint))
 }
 
-fn ppid_of(pid: c_int) -> c_int {
+fn bsdinfo(pid: c_int) -> Option<ProcBsdInfo> {
     let mut info = ProcBsdInfo::default();
     let sz = std::mem::size_of::<ProcBsdInfo>() as c_int;
     let rc = unsafe {
-        proc_pidinfo(
-            pid,
-            PROC_PIDTBSDINFO,
-            0,
-            &mut info as *mut _ as *mut c_void,
-            sz,
-        )
+        proc_pidinfo(pid, PROC_PIDTBSDINFO, 0,
+                     &mut info as *mut _ as *mut c_void, sz)
     };
-    if rc == sz {
-        info.pbi_ppid as c_int
-    } else {
-        0
-    }
+    if rc == sz { Some(info) } else { None }
+}
+
+fn ppid_of(pid: c_int) -> c_int {
+    bsdinfo(pid).map(|i| i.pbi_ppid as c_int).unwrap_or(0)
+}
+
+fn proc_start_sec(pid: c_int) -> u64 {
+    bsdinfo(pid).map(|i| i.pbi_start_tvsec).unwrap_or(0)
 }
 
 fn cstr_buf(buf: &[u8]) -> String {
@@ -450,35 +449,41 @@ fn truncate(s: &str, max: usize) -> String {
 
 // ---- watch / leak mode ----------------------------------------------------
 
-fn sample() -> std::collections::HashMap<c_int, (u64, u64)> {
+fn sample() -> std::collections::HashMap<c_int, (u64, u64, u64)> {
     let mut m = std::collections::HashMap::new();
     for pid in list_pids() {
-        if let Some(cf) = task_vm(pid) {
-            m.insert(pid, cf);
+        if let Some((compressed, footprint)) = task_vm(pid) {
+            let start = proc_start_sec(pid);
+            m.insert(pid, (compressed, footprint, start));
         }
     }
     m
 }
 
-fn run_watch(interval: u64, topn: usize, _show_parent: bool) {
+fn run_watch(interval: u64, topn: usize, show_parent: bool) {
     let a = sample();
-    let start = Instant::now();
+    let t0 = Instant::now();
     std::thread::sleep(Duration::from_secs(interval.max(1)));
     let b = sample();
-    let elapsed = start.elapsed().as_secs_f64().max(1e-9);
+    let elapsed = t0.elapsed().as_secs_f64().max(1e-9);
 
     struct Delta {
         pid: c_int,
+        ppid: c_int,
         name: String,
         foot0: u64,
         foot1: u64,
         delta: i128,
     }
     let mut deltas: Vec<Delta> = Vec::new();
-    for (pid, (_c1, f1)) in &b {
-        if let Some((_c0, f0)) = a.get(pid) {
+    for (pid, (_c1, f1, s1)) in &b {
+        if let Some((_c0, f0, s0)) = a.get(pid) {
+            if s0 != s1 {
+                continue; // PID reused between samples
+            }
             deltas.push(Delta {
                 pid: *pid,
+                ppid: if show_parent { ppid_of(*pid) } else { 0 },
                 name: proc_display_name(*pid),
                 foot0: *f0,
                 foot1: *f1,
@@ -488,27 +493,50 @@ fn run_watch(interval: u64, topn: usize, _show_parent: bool) {
     }
     deltas.sort_by(|x, y| y.delta.cmp(&x.delta));
 
-    let shown = if topn == 0 {
-        deltas.len()
-    } else {
-        topn.min(deltas.len())
-    };
+    let shown = if topn == 0 { deltas.len() } else { topn.min(deltas.len()) };
 
-    println!(
-        "{:<7} {:<24} {:>12} {:>12} {:>12} {:>12}",
-        "PID", "NAME", "FOOT0", "FOOT1", "DELTA", "RATE/s"
-    );
-    for d in deltas.iter().take(shown) {
-        let rate = d.delta as f64 / elapsed;
+    let mut pname_cache: std::collections::HashMap<c_int, String> = std::collections::HashMap::new();
+
+    if show_parent {
+        println!(
+            "{:<7} {:<7} {:<24} {:<20} {:>12} {:>12} {:>12} {:>12}",
+            "PID", "PPID", "NAME", "PARENT", "FOOT0", "FOOT1", "DELTA", "RATE/s"
+        );
+    } else {
         println!(
             "{:<7} {:<24} {:>12} {:>12} {:>12} {:>12}",
-            d.pid,
-            truncate(&d.name, 24),
-            human(d.foot0 as f64),
-            human(d.foot1 as f64),
-            human_signed(d.delta as f64),
-            human_signed(rate),
+            "PID", "NAME", "FOOT0", "FOOT1", "DELTA", "RATE/s"
         );
+    }
+    for d in deltas.iter().take(shown) {
+        let rate = d.delta as f64 / elapsed;
+        if show_parent {
+            let pname = pname_cache
+                .entry(d.ppid)
+                .or_insert_with(|| proc_display_name(d.ppid))
+                .clone();
+            println!(
+                "{:<7} {:<7} {:<24} {:<20} {:>12} {:>12} {:>12} {:>12}",
+                d.pid,
+                d.ppid,
+                truncate(&d.name, 24),
+                truncate(&pname, 20),
+                human(d.foot0 as f64),
+                human(d.foot1 as f64),
+                human_signed(d.delta as f64),
+                human_signed(rate),
+            );
+        } else {
+            println!(
+                "{:<7} {:<24} {:>12} {:>12} {:>12} {:>12}",
+                d.pid,
+                truncate(&d.name, 24),
+                human(d.foot0 as f64),
+                human(d.foot1 as f64),
+                human_signed(d.delta as f64),
+                human_signed(rate),
+            );
+        }
     }
     println!();
     println!(
@@ -522,8 +550,9 @@ fn run_watch(interval: u64, topn: usize, _show_parent: bool) {
 fn usage() {
     println!("macswapi [N] [-p|--parent] [-w|--watch [SECS]]");
     println!("  N            top N rows (default 20, 0=all)");
-    println!("  -p --parent  add PPID + parent-name columns");
-    println!("  -w --watch   leak mode; optional SECS interval (default 3)");
+    println!("  -p --parent  add PPID + parent-name columns (works in watch mode too)");
+    println!("  -w --watch   leak mode; SECS must immediately follow the flag (default 3)");
+    println!("               N must appear before -w: e.g. macswapi 50 -w 5");
     println!("  -h --help    this help");
 }
 
