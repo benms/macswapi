@@ -330,6 +330,13 @@ fn run_snapshot(topn: usize, show_parent: bool) {
         );
     }
 
+    // SWAP~ estimates are proportional splits of system swap across readable
+    // processes.  When denied > 0 the denominator is incomplete:
+    //   - total_compressed == 0 → every estimate is 0 despite real swap
+    //   - total_compressed > 0  → one visible process absorbs all system swap
+    // Show N/A in the zero-denominator case; warn whenever denied > 0.
+    let swap_denom_zero = denied > 0 && total_compressed == 0;
+
     let mut sum_est = 0.0f64;
     let mut sum_compressed = 0u64;
     let mut sum_footprint = 0u64;
@@ -340,9 +347,17 @@ fn run_snapshot(topn: usize, show_parent: bool) {
             total_compressed as f64,
             swap_total as f64,
         );
-        sum_est += est;
+        if !swap_denom_zero {
+            sum_est += est;
+        }
         sum_compressed += r.compressed;
         sum_footprint += r.footprint;
+
+        let swap_col = if swap_denom_zero {
+            "N/A".to_string()
+        } else {
+            human(est)
+        };
 
         if show_parent {
             let pname = pname_cache
@@ -357,7 +372,7 @@ fn run_snapshot(topn: usize, show_parent: bool) {
                 truncate(&pname, 20),
                 human(r.compressed as f64),
                 human(r.footprint as f64),
-                human(est),
+                swap_col,
             );
         } else {
             println!(
@@ -366,7 +381,7 @@ fn run_snapshot(topn: usize, show_parent: bool) {
                 truncate(&r.name, 24),
                 human(r.compressed as f64),
                 human(r.footprint as f64),
-                human(est),
+                swap_col,
             );
         }
     }
@@ -378,28 +393,49 @@ fn run_snapshot(topn: usize, show_parent: bool) {
         rows.len(),
         denied
     );
+
+    let swap_shown_str = if swap_denom_zero {
+        "N/A".to_string()
+    } else {
+        human(sum_est)
+    };
     println!(
         "shown totals: CMPRS {}  FOOTPRINT {}  SWAP~ {}",
         human(sum_compressed as f64),
         human(sum_footprint as f64),
-        human(sum_est),
+        swap_shown_str,
     );
-    // Full estimate sums to the real total (conservation).
-    let full_est: f64 = rows
-        .iter()
-        .map(|r| {
-            swap_share(
-                r.compressed as f64,
-                total_compressed as f64,
-                swap_total as f64,
-            )
-        })
-        .sum();
+
+    let full_est: f64 = if swap_denom_zero {
+        0.0
+    } else {
+        rows.iter()
+            .map(|r| {
+                swap_share(
+                    r.compressed as f64,
+                    total_compressed as f64,
+                    swap_total as f64,
+                )
+            })
+            .sum()
+    };
+    let full_est_str = if swap_denom_zero {
+        "N/A (denominator is 0 — run as root for accurate estimates)".to_string()
+    } else {
+        human(full_est)
+    };
     println!(
         "swap (sysctl vm.swapusage used): {}   Σ est over all procs: {}",
         human(swap_total as f64),
-        human(full_est),
+        full_est_str,
     );
+    if denied > 0 && !swap_denom_zero {
+        eprintln!(
+            "WARNING: {} proc(s) denied — SWAP~ estimates cover only visible processes; \
+             a single visible process may absorb all system swap. Run as root for accuracy.",
+            denied
+        );
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
