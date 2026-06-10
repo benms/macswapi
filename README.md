@@ -27,6 +27,25 @@ splitting the real total proportional to each process's compressed memory (where
 swap pressure originates). The estimates sum to the real total to the byte —
 enforced by a unit test.
 
+### Estimate caveats
+
+**Bias toward idle processes.** The compressor evicts least-recently-used
+segments first, so idle processes hold a disproportionate share of on-disk swap
+relative to their compressed-memory size. A busy process with a hot compressed
+pool is therefore *overweighted* by this estimate.
+
+**Compression ratio assumed uniform.** `compressed` (from `task_info`) is the
+*uncompressed* size of memory the compressor holds for a process. `xsu_used`
+(from `vm.swapusage`) is the *compressed* on-disk size across all processes.
+The proportional split implicitly assumes every process's data compresses at the
+same ratio. Processes whose data compresses poorly will be underweighted; those
+that compress well will be overweighted.
+
+**kernel_task excluded.** `task_for_pid(0)` is always denied, even under
+`sudo`, so kernel-compressed memory never appears in the denominator. User
+processes are therefore slightly over-attributed — the gap is small in practice
+but grows under kernel memory pressure.
+
 ## Build
 
 ```sh
