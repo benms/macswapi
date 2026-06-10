@@ -202,9 +202,6 @@ fn ppid_of(pid: c_int) -> c_int {
     bsdinfo(pid).map(|i| i.pbi_ppid as c_int).unwrap_or(0)
 }
 
-fn proc_start_sec(pid: c_int) -> u64 {
-    bsdinfo(pid).map(|i| i.pbi_start_tvsec).unwrap_or(0)
-}
 
 fn cstr_buf(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
@@ -214,7 +211,7 @@ fn cstr_buf(buf: &[u8]) -> String {
 fn proc_display_name(pid: c_int) -> String {
     let mut buf = [0u8; PROC_PIDPATHINFO_MAXSIZE];
     let n = unsafe { proc_pidpath(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };
-    if n > 0 {
+    if n > 0 && (n as usize) <= buf.len() {
         let path = cstr_buf(&buf[..n as usize]);
         if !path.is_empty() {
             return basename(&path).to_string();
@@ -222,7 +219,7 @@ fn proc_display_name(pid: c_int) -> String {
     }
     let mut nb = [0u8; 256];
     let n = unsafe { proc_name(pid, nb.as_mut_ptr() as *mut c_void, nb.len() as u32) };
-    if n > 0 {
+    if n > 0 && (n as usize) <= nb.len() {
         let name = cstr_buf(&nb[..n as usize]);
         if !name.is_empty() {
             return name;
@@ -449,12 +446,14 @@ fn truncate(s: &str, max: usize) -> String {
 
 // ---- watch / leak mode ----------------------------------------------------
 
-fn sample() -> std::collections::HashMap<c_int, (u64, u64, u64)> {
+fn sample() -> std::collections::HashMap<c_int, (u64, u64, u64, c_int)> {
     let mut m = std::collections::HashMap::new();
     for pid in list_pids() {
         if let Some((compressed, footprint)) = task_vm(pid) {
-            let start = proc_start_sec(pid);
-            m.insert(pid, (compressed, footprint, start));
+            let info = bsdinfo(pid);
+            let start = info.as_ref().map(|i| i.pbi_start_tvsec).unwrap_or(0);
+            let ppid = info.as_ref().map(|i| i.pbi_ppid as c_int).unwrap_or(0);
+            m.insert(pid, (compressed, footprint, start, ppid));
         }
     }
     m
@@ -476,14 +475,14 @@ fn run_watch(interval: u64, topn: usize, show_parent: bool) {
         delta: i128,
     }
     let mut deltas: Vec<Delta> = Vec::new();
-    for (pid, (_c1, f1, s1)) in &b {
-        if let Some((_c0, f0, s0)) = a.get(pid) {
+    for (pid, (_c1, f1, s1, p1)) in &b {
+        if let Some((_c0, f0, s0, _p0)) = a.get(pid) {
             if s0 != s1 {
                 continue; // PID reused between samples
             }
             deltas.push(Delta {
                 pid: *pid,
-                ppid: if show_parent { ppid_of(*pid) } else { 0 },
+                ppid: if show_parent { *p1 } else { 0 },
                 name: proc_display_name(*pid),
                 foot0: *f0,
                 foot1: *f1,
