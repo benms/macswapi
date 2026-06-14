@@ -5,6 +5,8 @@
 //! `task_info(TASK_VM_INFO)` and ESTIMATE per-proc swap by splitting the real
 //! `vm.swapusage` total proportional to each proc's compressed memory.
 
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
@@ -56,10 +58,10 @@ extern "C" {
 #[repr(C)]
 #[derive(Default)]
 struct TaskVmInfo {
-    virtual_size: u64,           // off 0
-    region_count: i32,           // off 8
-    page_size: i32,              // off 12
-    resident_size: u64,          // off 16
+    virtual_size: u64,  // off 0
+    region_count: i32,  // off 8
+    page_size: i32,     // off 12
+    resident_size: u64, // off 16
     resident_size_peak: u64,
     device: u64,
     device_peak: u64,
@@ -72,10 +74,10 @@ struct TaskVmInfo {
     purgeable_volatile_pmap: u64,
     purgeable_volatile_resident: u64,
     purgeable_volatile_virtual: u64,
-    compressed: u64,             // off 120  <-- READ THIS
+    compressed: u64, // off 120  <-- READ THIS
     compressed_peak: u64,
     compressed_lifetime: u64,
-    phys_footprint: u64,         // off 144  <-- READ THIS
+    phys_footprint: u64, // off 144  <-- READ THIS
 }
 // size_of == 152, /4 == 38 = the count passed to task_info.
 
@@ -120,12 +122,12 @@ struct XswUsage {
 
 // ---- core kernel functions ------------------------------------------------
 
-fn swap_used_bytes() -> u64 {
+fn swap_used_bytes() -> Result<u64, std::io::Error> {
     let mut xsw = XswUsage::default();
     let mut size = std::mem::size_of::<XswUsage>();
     let rc = unsafe {
         sysctlbyname(
-            b"vm.swapusage\0".as_ptr() as *const c_char,
+            c"vm.swapusage".as_ptr(),
             &mut xsw as *mut _ as *mut c_void,
             &mut size,
             ptr::null_mut(),
@@ -133,9 +135,9 @@ fn swap_used_bytes() -> u64 {
         )
     };
     if rc == 0 {
-        xsw.xsu_used
+        Ok(xsw.xsu_used)
     } else {
-        0
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -192,16 +194,24 @@ fn bsdinfo(pid: c_int) -> Option<ProcBsdInfo> {
     let mut info = ProcBsdInfo::default();
     let sz = std::mem::size_of::<ProcBsdInfo>() as c_int;
     let rc = unsafe {
-        proc_pidinfo(pid, PROC_PIDTBSDINFO, 0,
-                     &mut info as *mut _ as *mut c_void, sz)
+        proc_pidinfo(
+            pid,
+            PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut c_void,
+            sz,
+        )
     };
-    if rc == sz { Some(info) } else { None }
+    if rc == sz {
+        Some(info)
+    } else {
+        None
+    }
 }
 
 fn ppid_of(pid: c_int) -> c_int {
     bsdinfo(pid).map(|i| i.pbi_ppid as c_int).unwrap_or(0)
 }
-
 
 fn cstr_buf(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
@@ -252,6 +262,10 @@ fn swap_share(compressed: f64, total_compressed: f64, swap_total: f64) -> f64 {
     }
 }
 
+fn swap_estimates_available(swap_total: Option<u64>, total_compressed: u64) -> bool {
+    swap_total.is_some() && total_compressed > 0
+}
+
 fn human(bytes: f64) -> String {
     const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
     let mut v = bytes;
@@ -285,7 +299,13 @@ struct Row {
 // ---- snapshot mode --------------------------------------------------------
 
 fn run_snapshot(topn: usize, show_parent: bool) {
-    let swap_total = swap_used_bytes();
+    let swap_total = match swap_used_bytes() {
+        Ok(bytes) => Some(bytes),
+        Err(err) => {
+            eprintln!("WARNING: could not read sysctl vm.swapusage: {err}; SWAP~ unavailable.");
+            None
+        }
+    };
     let mut rows: Vec<Row> = Vec::new();
     let mut denied = 0usize;
 
@@ -302,7 +322,7 @@ fn run_snapshot(topn: usize, show_parent: bool) {
         }
     }
 
-    rows.sort_by(|a, b| b.compressed.cmp(&a.compressed));
+    rows.sort_by_key(|r| (Reverse(r.compressed), r.pid));
     let total_compressed: u64 = rows.iter().map(|r| r.compressed).sum();
 
     let shown = if topn == 0 {
@@ -312,7 +332,7 @@ fn run_snapshot(topn: usize, show_parent: bool) {
     };
 
     // parent-name cache (many children share one parent).
-    let mut pname_cache: std::collections::HashMap<c_int, String> = std::collections::HashMap::new();
+    let mut pname_cache: HashMap<c_int, String> = HashMap::new();
 
     if show_parent {
         println!(
@@ -330,26 +350,34 @@ fn run_snapshot(topn: usize, show_parent: bool) {
     // processes.  When denied > 0 the denominator is incomplete:
     //   - total_compressed == 0 → every estimate is 0 despite real swap
     //   - total_compressed > 0  → one visible process absorbs all system swap
-    // Show N/A in the zero-denominator case; warn whenever denied > 0.
-    let swap_denom_zero = denied > 0 && total_compressed == 0;
+    // Show N/A if the system swap total is unavailable or the denominator is 0;
+    // warn whenever denied > 0.
+    let swap_denom_zero = total_compressed == 0;
+    let swap_est_unavailable = !swap_estimates_available(swap_total, total_compressed);
 
     let mut sum_est = 0.0f64;
     let mut sum_compressed = 0u64;
     let mut sum_footprint = 0u64;
 
     for r in rows.iter().take(shown) {
-        let est = swap_share(
-            r.compressed as f64,
-            total_compressed as f64,
-            swap_total as f64,
-        );
-        if !swap_denom_zero {
+        let est = if swap_est_unavailable {
+            0.0
+        } else {
+            let swap_total =
+                swap_total.expect("swap_total is available when estimates are available");
+            swap_share(
+                r.compressed as f64,
+                total_compressed as f64,
+                swap_total as f64,
+            )
+        };
+        if !swap_est_unavailable {
             sum_est += est;
         }
         sum_compressed += r.compressed;
         sum_footprint += r.footprint;
 
-        let swap_col = if swap_denom_zero {
+        let swap_col = if swap_est_unavailable {
             "N/A".to_string()
         } else {
             human(est)
@@ -390,7 +418,7 @@ fn run_snapshot(topn: usize, show_parent: bool) {
         denied
     );
 
-    let swap_shown_str = if swap_denom_zero {
+    let swap_shown_str = if swap_est_unavailable {
         "N/A".to_string()
     } else {
         human(sum_est)
@@ -402,9 +430,10 @@ fn run_snapshot(topn: usize, show_parent: bool) {
         swap_shown_str,
     );
 
-    let full_est: f64 = if swap_denom_zero {
+    let full_est: f64 = if swap_est_unavailable {
         0.0
     } else {
+        let swap_total = swap_total.expect("swap_total is available when estimates are available");
         rows.iter()
             .map(|r| {
                 swap_share(
@@ -415,17 +444,21 @@ fn run_snapshot(topn: usize, show_parent: bool) {
             })
             .sum()
     };
-    let full_est_str = if swap_denom_zero {
+    let swap_total_str = swap_total
+        .map(|bytes| human(bytes as f64))
+        .unwrap_or_else(|| "N/A".to_string());
+    let full_est_str = if swap_total.is_none() {
+        "N/A (vm.swapusage unavailable)".to_string()
+    } else if swap_denom_zero {
         "N/A (denominator is 0 — run as root for accurate estimates)".to_string()
     } else {
         human(full_est)
     };
     println!(
-        "swap (sysctl vm.swapusage used): {}   Σ est over all procs: {}",
-        human(swap_total as f64),
-        full_est_str,
+        "swap (sysctl vm.swapusage used): {}   Σ est over readable procs: {}",
+        swap_total_str, full_est_str,
     );
-    if denied > 0 && !swap_denom_zero {
+    if denied > 0 && !swap_est_unavailable {
         eprintln!(
             "WARNING: {} proc(s) denied — SWAP~ estimates cover only visible processes; \
              a single visible process may absorb all system swap. Run as root for accuracy.",
@@ -435,10 +468,12 @@ fn run_snapshot(topn: usize, show_parent: bool) {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if max == 0 {
+        String::new()
+    } else if s.chars().count() <= max {
         s.to_string()
     } else {
-        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+        let mut t: String = s.chars().take(max - 1).collect();
         t.push('…');
         t
     }
@@ -446,17 +481,53 @@ fn truncate(s: &str, max: usize) -> String {
 
 // ---- watch / leak mode ----------------------------------------------------
 
-fn sample() -> std::collections::HashMap<c_int, (u64, u64, u64, c_int)> {
-    let mut m = std::collections::HashMap::new();
+type StartTime = (u64, u64);
+
+#[derive(Clone, Copy)]
+struct Sample {
+    footprint: u64,
+    start: Option<StartTime>,
+    ppid: c_int,
+}
+
+struct SampleSet {
+    rows: HashMap<c_int, Sample>,
+    denied: usize,
+}
+
+impl SampleSet {
+    fn total(&self) -> usize {
+        self.rows.len() + self.denied
+    }
+}
+
+fn same_process_start(a: Option<StartTime>, b: Option<StartTime>) -> bool {
+    matches!((a, b), (Some(a), Some(b)) if a == b)
+}
+
+fn sample() -> SampleSet {
+    let mut rows = HashMap::new();
+    let mut denied = 0usize;
     for pid in list_pids() {
-        if let Some((compressed, footprint)) = task_vm(pid) {
+        if let Some((_compressed, footprint)) = task_vm(pid) {
             let info = bsdinfo(pid);
-            let start = info.as_ref().map(|i| i.pbi_start_tvsec).unwrap_or(0);
+            let start = info
+                .as_ref()
+                .map(|i| (i.pbi_start_tvsec, i.pbi_start_tvusec));
             let ppid = info.as_ref().map(|i| i.pbi_ppid as c_int).unwrap_or(0);
-            m.insert(pid, (compressed, footprint, start, ppid));
+            rows.insert(
+                pid,
+                Sample {
+                    footprint,
+                    start,
+                    ppid,
+                },
+            );
+        } else {
+            denied += 1;
         }
     }
-    m
+    SampleSet { rows, denied }
 }
 
 fn run_watch(interval: u64, topn: usize, show_parent: bool) {
@@ -475,26 +546,30 @@ fn run_watch(interval: u64, topn: usize, show_parent: bool) {
         delta: i128,
     }
     let mut deltas: Vec<Delta> = Vec::new();
-    for (pid, (_c1, f1, s1, p1)) in &b {
-        if let Some((_c0, f0, s0, _p0)) = a.get(pid) {
-            if s0 != s1 {
-                continue; // PID reused between samples
+    for (pid, b_sample) in &b.rows {
+        if let Some(a_sample) = a.rows.get(pid) {
+            if !same_process_start(a_sample.start, b_sample.start) {
+                continue; // PID reused or start time unavailable between samples
             }
             deltas.push(Delta {
                 pid: *pid,
-                ppid: if show_parent { *p1 } else { 0 },
+                ppid: if show_parent { b_sample.ppid } else { 0 },
                 name: proc_display_name(*pid),
-                foot0: *f0,
-                foot1: *f1,
-                delta: *f1 as i128 - *f0 as i128,
+                foot0: a_sample.footprint,
+                foot1: b_sample.footprint,
+                delta: b_sample.footprint as i128 - a_sample.footprint as i128,
             });
         }
     }
-    deltas.sort_by(|x, y| y.delta.cmp(&x.delta));
+    deltas.sort_by_key(|d| (Reverse(d.delta), d.pid));
 
-    let shown = if topn == 0 { deltas.len() } else { topn.min(deltas.len()) };
+    let shown = if topn == 0 {
+        deltas.len()
+    } else {
+        topn.min(deltas.len())
+    };
 
-    let mut pname_cache: std::collections::HashMap<c_int, String> = std::collections::HashMap::new();
+    let mut pname_cache: HashMap<c_int, String> = HashMap::new();
 
     if show_parent {
         println!(
@@ -542,63 +617,109 @@ fn run_watch(interval: u64, topn: usize, show_parent: bool) {
         "interval {:.1}s — one interval = allocation churn; trust SUSTAINED growth as leak signal.",
         elapsed
     );
+    println!(
+        "sampled procs: first {}/{} readable ({} denied), second {}/{} readable ({} denied)",
+        a.rows.len(),
+        a.total(),
+        a.denied,
+        b.rows.len(),
+        b.total(),
+        b.denied,
+    );
 }
 
 // ---- CLI ------------------------------------------------------------------
 
+#[derive(Debug, PartialEq, Eq)]
+struct Config {
+    topn: usize,
+    show_parent: bool,
+    watch_secs: Option<u64>,
+    help: bool,
+}
+
 fn usage() {
-    println!("macswapi [N] [-p|--parent] [-w|--watch [SECS]]");
+    println!("macswapi [N] [-p|--parent] [-w|--watch|--delta [SECS]]");
     println!("  N            top N rows (default 20, 0=all)");
     println!("  -p --parent  add PPID + parent-name columns (works in watch mode too)");
-    println!("  -w --watch   leak mode; SECS must immediately follow the flag (default 3)");
-    println!("               N must appear before -w: e.g. macswapi 50 -w 5");
+    println!("  -w --watch   single-interval leak check; SECS must immediately follow the flag");
+    println!("     --delta   clearer alias for --watch (default interval 3s)");
+    println!("               SECS must be positive; N must appear before the interval flag");
+    println!("               example: macswapi 50 --delta 5");
     println!("  -h --help    this help");
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    let mut topn: usize = 20;
-    let mut show_parent = false;
-    let mut watch = false;
-    let mut watch_secs: u64 = 3;
+fn parse_args(args: &[String]) -> Result<Config, String> {
+    let mut config = Config {
+        topn: 20,
+        show_parent: false,
+        watch_secs: None,
+        help: false,
+    };
+    let mut saw_interval_flag = false;
 
     let mut i = 0;
     while i < args.len() {
-        let a = &args[i];
-        match a.as_str() {
+        let arg = &args[i];
+        match arg.as_str() {
             "-h" | "--help" => {
-                usage();
-                return;
+                config.help = true;
+                return Ok(config);
             }
-            "-p" | "--parent" => show_parent = true,
-            "-w" | "--watch" => {
-                watch = true;
-                // Optional SECS in the next token.
+            "-p" | "--parent" => config.show_parent = true,
+            "-w" | "--watch" | "--delta" => {
+                if saw_interval_flag {
+                    return Err("duplicate interval flag".to_string());
+                }
+                saw_interval_flag = true;
+                config.watch_secs = Some(3);
                 if i + 1 < args.len() {
-                    if let Ok(s) = args[i + 1].parse::<u64>() {
-                        watch_secs = s;
+                    if let Ok(secs) = args[i + 1].parse::<u64>() {
+                        if secs == 0 {
+                            return Err("watch interval must be positive".to_string());
+                        }
+                        config.watch_secs = Some(secs);
                         i += 1;
                     }
                 }
             }
             other => {
-                if let Ok(n) = other.parse::<usize>() {
-                    topn = n;
+                if let Ok(topn) = other.parse::<usize>() {
+                    if saw_interval_flag {
+                        return Err("N must appear before the interval flag".to_string());
+                    }
+                    config.topn = topn;
                 } else {
-                    eprintln!("unknown arg: {other}");
-                    usage();
-                    std::process::exit(2);
+                    return Err(format!("unknown arg: {other}"));
                 }
             }
         }
         i += 1;
     }
 
-    if watch {
-        run_watch(watch_secs, topn, show_parent);
+    Ok(config)
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let config = match parse_args(&args) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("{err}");
+            usage();
+            std::process::exit(2);
+        }
+    };
+
+    if config.help {
+        usage();
+        return;
+    }
+
+    if let Some(watch_secs) = config.watch_secs {
+        run_watch(watch_secs, config.topn, config.show_parent);
     } else {
-        run_snapshot(topn, show_parent);
+        run_snapshot(config.topn, config.show_parent);
     }
 }
 
@@ -636,6 +757,13 @@ mod tests {
     }
 
     #[test]
+    fn test_swap_estimates_available_requires_total_and_denominator() {
+        assert!(!swap_estimates_available(None, 100));
+        assert!(!swap_estimates_available(Some(1000), 0));
+        assert!(swap_estimates_available(Some(1000), 1));
+    }
+
+    #[test]
     fn test_conservation() {
         let compressed = [10u64, 25, 3, 100, 7, 512, 64, 1];
         let total: u64 = compressed.iter().sum();
@@ -653,6 +781,51 @@ mod tests {
         assert_eq!(basename("node"), "node");
         assert_eq!(basename("/usr/bin/"), "/usr/bin/"); // trailing slash → whole
         assert_eq!(basename(""), "");
+    }
+
+    #[test]
+    fn test_truncate() {
+        assert_eq!(truncate("abcdef", 0), "");
+        assert_eq!(truncate("abcdef", 1), "…");
+        assert_eq!(truncate("abcdef", 4), "abc…");
+        assert_eq!(truncate("abc", 4), "abc");
+    }
+
+    #[test]
+    fn test_same_process_start_fails_closed() {
+        assert!(same_process_start(Some((10, 20)), Some((10, 20))));
+        assert!(!same_process_start(Some((10, 20)), Some((10, 21))));
+        assert!(!same_process_start(None, Some((10, 20))));
+        assert!(!same_process_start(Some((10, 20)), None));
+        assert!(!same_process_start(None, None));
+    }
+
+    fn parse(words: &[&str]) -> Result<Config, String> {
+        let args: Vec<String> = words.iter().map(|s| s.to_string()).collect();
+        parse_args(&args)
+    }
+
+    #[test]
+    fn test_parse_args_accepts_strict_interval_order() {
+        assert_eq!(
+            parse(&["20", "--delta", "5"]).unwrap(),
+            Config {
+                topn: 20,
+                show_parent: false,
+                watch_secs: Some(5),
+                help: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_args_rejects_n_after_interval_flag() {
+        assert!(parse(&["--delta", "5", "20"]).is_err());
+    }
+
+    #[test]
+    fn test_parse_args_rejects_zero_interval() {
+        assert!(parse(&["--watch", "0"]).is_err());
     }
 
     #[test]

@@ -24,8 +24,8 @@ What *is* exact and obtainable:
 
 So macswapi reports exact compressed/footprint and **estimates** swap by
 splitting the real total proportional to each process's compressed memory (where
-swap pressure originates). The estimates sum to the real total to the byte —
-enforced by a unit test.
+swap pressure originates). The estimates are computed so their floating-point
+sum matches the real total within a small test tolerance.
 
 ### Estimate caveats
 
@@ -46,6 +46,10 @@ that compress well will be overweighted.
 processes are therefore slightly over-attributed — the gap is small in practice
 but grows under kernel memory pressure.
 
+**Columns are not additive.** `FOOTPRINT` is the process's physical footprint
+ledger value and already accounts for compressed memory. `CMPRS` explains one
+component of pressure; do not add `CMPRS + FOOTPRINT` as a total.
+
 ## Build
 
 ```sh
@@ -59,12 +63,12 @@ link time → network-free build.
 ## Usage
 
 ```
-macswapi [N] [-p|--parent] [-w|--watch [SECS]]
+macswapi [N] [-p|--parent] [-w|--watch|--delta [SECS]]
 ```
 
 - `N` — top N rows (default 20, `0` = all)
 - `-p`, `--parent` — add PPID + parent-name columns
-- `-w`, `--watch [SECS]` — leak mode: footprint delta + rate/s over an interval (default 3s)
+- `-w`, `--watch [SECS]`, `--delta [SECS]` — single-interval leak check over a positive interval (default 3s); `N` must appear before the interval flag
 - `-h`, `--help` — usage
 
 ```sh
