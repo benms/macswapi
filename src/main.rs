@@ -8,6 +8,7 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::io::{BufRead, BufReader, IsTerminal};
 use std::os::raw::{c_char, c_int};
 use std::ptr;
 use std::time::{Duration, Instant};
@@ -23,14 +24,13 @@ const KERN_SUCCESS: KernReturn = 0;
 const TASK_VM_INFO: TaskFlavor = 22;
 const PROC_ALL_PIDS: u32 = 1;
 const PROC_PIDTBSDINFO: c_int = 3;
-#[allow(dead_code)]
 const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
 
 // ---- FFI (libSystem, linked automatically on macOS) -----------------------
 
 extern "C" {
     static mach_task_self_: MachPort;
-    fn task_for_pid(target: MachPort, pid: c_int, t: *mut MachPort) -> KernReturn;
+    fn task_name_for_pid(target: MachPort, pid: c_int, t: *mut MachPort) -> KernReturn;
     fn task_info(
         task: MachPort,
         flavor: TaskFlavor,
@@ -170,10 +170,12 @@ fn list_pids() -> Vec<c_int> {
     buf.into_iter().filter(|&p| p > 0).collect()
 }
 
-/// Returns (compressed, phys_footprint) or None if denied (needs root / SIP).
+/// Returns (compressed, phys_footprint) or None if denied (another user's
+/// process without root). A task *name* port is enough for `task_info`;
+/// `task_for_pid` would need root and is still refused for SIP-protected procs.
 fn task_vm(pid: c_int) -> Option<(u64, u64)> {
     let mut task: MachPort = 0;
-    let kr = unsafe { task_for_pid(mach_task_self_, pid, &mut task) };
+    let kr = unsafe { task_name_for_pid(mach_task_self_, pid, &mut task) };
     if kr != KERN_SUCCESS {
         return None;
     }
@@ -258,16 +260,12 @@ fn basename(path: &str) -> &str {
     }
 }
 
-fn swap_share(compressed: f64, total_compressed: f64, swap_total: f64) -> f64 {
-    if total_compressed == 0.0 {
-        0.0
-    } else {
-        swap_total * (compressed / total_compressed)
-    }
-}
-
-fn swap_estimates_available(swap_total: Option<u64>, total_compressed: u64) -> bool {
-    swap_total.is_some() && total_compressed > 0
+/// Swap bytes attributed per compressed byte, or None when the swap total is
+/// unavailable or no readable process holds compressed memory.
+fn swap_ratio(swap_total: Option<u64>, total_compressed: u64) -> Option<f64> {
+    swap_total
+        .filter(|_| total_compressed > 0)
+        .map(|swap| swap as f64 / total_compressed as f64)
 }
 
 fn human(bytes: f64) -> String {
@@ -294,10 +292,8 @@ fn human_signed(delta: f64) -> String {
 
 struct Row {
     pid: c_int,
-    name: String,
     compressed: u64,
     footprint: u64,
-    ppid: c_int,
 }
 
 // ---- snapshot mode --------------------------------------------------------
@@ -317,10 +313,8 @@ fn run_snapshot(topn: usize, show_parent: bool) {
         match task_vm(pid) {
             Some((compressed, footprint)) => rows.push(Row {
                 pid,
-                name: proc_display_name(pid),
                 compressed,
                 footprint,
-                ppid: if show_parent { ppid_of(pid) } else { 0 },
             }),
             None => denied += 1,
         }
@@ -351,118 +345,77 @@ fn run_snapshot(topn: usize, show_parent: bool) {
     }
 
     // SWAP~ estimates are proportional splits of system swap across readable
-    // processes.  When denied > 0 the denominator is incomplete:
-    //   - total_compressed == 0 → every estimate is 0 despite real swap
-    //   - total_compressed > 0  → one visible process absorbs all system swap
-    // Show N/A if the system swap total is unavailable or the denominator is 0;
-    // warn whenever denied > 0.
-    let swap_denom_zero = total_compressed == 0;
-    let swap_est_unavailable = !swap_estimates_available(swap_total, total_compressed);
+    // processes, shown as N/A if the system swap total is unavailable or the
+    // denominator is 0. When denied > 0 the denominator is incomplete and one
+    // visible process may absorb all system swap; warn about that below.
+    let swap_per_cmprs = swap_ratio(swap_total, total_compressed);
+    let swap_str =
+        |cmprs: u64| swap_per_cmprs.map_or_else(|| "N/A".to_string(), |k| human(cmprs as f64 * k));
 
-    let mut sum_est = 0.0f64;
     let mut sum_compressed = 0u64;
     let mut sum_footprint = 0u64;
 
+    // Names and parents are looked up only for shown rows.
     for r in rows.iter().take(shown) {
-        let est = if swap_est_unavailable {
-            0.0
-        } else {
-            let swap_total =
-                swap_total.expect("swap_total is available when estimates are available");
-            swap_share(
-                r.compressed as f64,
-                total_compressed as f64,
-                swap_total as f64,
-            )
-        };
-        if !swap_est_unavailable {
-            sum_est += est;
-        }
         sum_compressed += r.compressed;
         sum_footprint += r.footprint;
-
-        let swap_col = if swap_est_unavailable {
-            "N/A".to_string()
-        } else {
-            human(est)
-        };
+        let name = proc_display_name(r.pid);
 
         if show_parent {
+            let ppid = ppid_of(r.pid);
             let pname = pname_cache
-                .entry(r.ppid)
-                .or_insert_with(|| proc_display_name(r.ppid))
+                .entry(ppid)
+                .or_insert_with(|| proc_display_name(ppid))
                 .clone();
             println!(
                 "{:<7} {:<7} {:<24} {:<20} {:>12} {:>12} {:>12}",
                 r.pid,
-                r.ppid,
-                truncate(&r.name, 24),
+                ppid,
+                truncate(&name, 24),
                 truncate(&pname, 20),
                 human(r.compressed as f64),
                 human(r.footprint as f64),
-                swap_col,
+                swap_str(r.compressed),
             );
         } else {
             println!(
                 "{:<7} {:<24} {:>12} {:>12} {:>12}",
                 r.pid,
-                truncate(&r.name, 24),
+                truncate(&name, 24),
                 human(r.compressed as f64),
                 human(r.footprint as f64),
-                swap_col,
+                swap_str(r.compressed),
             );
         }
     }
 
+    let sudo_hint = if denied > 0 {
+        " — need sudo for other users"
+    } else {
+        ""
+    };
     println!();
     println!(
-        "shown {}/{} procs  ({} denied — need sudo for other users)",
+        "shown {}/{} procs  ({} denied{})",
         shown,
         rows.len(),
-        denied
+        denied,
+        sudo_hint
     );
 
-    let swap_shown_str = if swap_est_unavailable {
-        "N/A".to_string()
-    } else {
-        human(sum_est)
-    };
     println!(
         "shown totals: CMPRS {}  FOOTPRINT {}  SWAP~ {}",
         human(sum_compressed as f64),
         human(sum_footprint as f64),
-        swap_shown_str,
+        swap_str(sum_compressed),
     );
 
-    let full_est: f64 = if swap_est_unavailable {
-        0.0
-    } else {
-        let swap_total = swap_total.expect("swap_total is available when estimates are available");
-        rows.iter()
-            .map(|r| {
-                swap_share(
-                    r.compressed as f64,
-                    total_compressed as f64,
-                    swap_total as f64,
-                )
-            })
-            .sum()
-    };
-    let swap_total_str = swap_total
-        .map(|bytes| human(bytes as f64))
-        .unwrap_or_else(|| "N/A".to_string());
-    let full_est_str = if swap_total.is_none() {
-        "N/A (vm.swapusage unavailable)".to_string()
-    } else if swap_denom_zero {
-        "N/A (denominator is 0 — run as root for accurate estimates)".to_string()
-    } else {
-        human(full_est)
-    };
-    println!(
-        "swap (sysctl vm.swapusage used): {}   Σ est over readable procs: {}",
-        swap_total_str, full_est_str,
-    );
-    if denied > 0 && !swap_est_unavailable {
+    let swap_total_str = swap_total.map_or_else(|| "N/A".to_string(), |b| human(b as f64));
+    println!("swap (sysctl vm.swapusage used): {swap_total_str}");
+    if swap_total.is_some() && swap_per_cmprs.is_none() {
+        println!("SWAP~ N/A: denominator is 0 — run as root for accurate estimates");
+    }
+    if denied > 0 && swap_per_cmprs.is_some() {
         eprintln!(
             "WARNING: {} proc(s) denied — SWAP~ estimates cover only visible processes; \
              a single visible process may absorb all system swap. Run as root for accuracy.",
@@ -544,7 +497,6 @@ fn run_watch(interval: u64, topn: usize, show_parent: bool) {
     struct Delta {
         pid: c_int,
         ppid: c_int,
-        name: String,
         foot0: u64,
         foot1: u64,
         delta: i128,
@@ -558,7 +510,6 @@ fn run_watch(interval: u64, topn: usize, show_parent: bool) {
             deltas.push(Delta {
                 pid: *pid,
                 ppid: if show_parent { b_sample.ppid } else { 0 },
-                name: proc_display_name(*pid),
                 foot0: a_sample.footprint,
                 foot1: b_sample.footprint,
                 delta: b_sample.footprint as i128 - a_sample.footprint as i128,
@@ -588,6 +539,7 @@ fn run_watch(interval: u64, topn: usize, show_parent: bool) {
     }
     for d in deltas.iter().take(shown) {
         let rate = d.delta as f64 / elapsed;
+        let name = proc_display_name(d.pid);
         if show_parent {
             let pname = pname_cache
                 .entry(d.ppid)
@@ -597,7 +549,7 @@ fn run_watch(interval: u64, topn: usize, show_parent: bool) {
                 "{:<7} {:<7} {:<24} {:<20} {:>12} {:>12} {:>12} {:>12}",
                 d.pid,
                 d.ppid,
-                truncate(&d.name, 24),
+                truncate(&name, 24),
                 truncate(&pname, 20),
                 human(d.foot0 as f64),
                 human(d.foot1 as f64),
@@ -608,7 +560,7 @@ fn run_watch(interval: u64, topn: usize, show_parent: bool) {
             println!(
                 "{:<7} {:<24} {:>12} {:>12} {:>12} {:>12}",
                 d.pid,
-                truncate(&d.name, 24),
+                truncate(&name, 24),
                 human(d.foot0 as f64),
                 human(d.foot1 as f64),
                 human_signed(d.delta as f64),
@@ -678,6 +630,11 @@ fn classify_event(msg: &str) -> Option<EventKind> {
     let m = msg.to_ascii_lowercase();
     if m.contains("swapfile") || m.contains("macx_swap") {
         Some(EventKind::Swapfile)
+    } else if m.contains("memorystatus: killing (idle)") {
+        // The kernel logs each idle kill twice: `killing (idle) NAME [PID] ...`
+        // then `killing_idle_process pid PID [NAME] ...`. Keep only the second,
+        // whose layout extract_jetsam() understands.
+        None
     } else if m.contains("memorystatus") && m.contains("kill") {
         Some(EventKind::Jetsam)
     } else if m.contains("pressure") && (m.contains("memory") || m.contains("vm")) {
@@ -813,9 +770,9 @@ fn event_json(e: &LogEvent) -> String {
     format!("{{{}}}", fields.join(", "))
 }
 
-/// Runs `log show` and returns its stdout, or an error string.
-fn query_log(hours: u64) -> Result<String, String> {
-    let out = std::process::Command::new("/usr/bin/log")
+/// Spawns `log show` with its stdout piped to us; its stderr passes through.
+fn spawn_log_show(hours: u64) -> std::io::Result<std::process::Child> {
+    std::process::Command::new("/usr/bin/log")
         .args([
             "show",
             "--last",
@@ -825,50 +782,67 @@ fn query_log(hours: u64) -> Result<String, String> {
             "--predicate",
             LOG_PREDICATE,
         ])
-        .output()
-        .map_err(|e| format!("could not run /usr/bin/log: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "log show failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
 }
 
-/// Returns the process exit code.
+/// Returns the process exit code. Text events print as `log show` emits them,
+/// since a long query can take minutes; JSON prints once the query finishes.
 fn run_logs(hours: u64, format: OutputFormat) -> i32 {
-    let output = match query_log(hours) {
-        Ok(s) => s,
+    if std::io::stderr().is_terminal() {
+        eprintln!("querying unified log for the last {hours}h (can take minutes)…");
+    }
+    let mut child = match spawn_log_show(hours) {
+        Ok(child) => child,
         Err(e) => {
-            eprintln!("{e}");
+            eprintln!("could not run /usr/bin/log: {e}");
             return 1;
         }
     };
-    let events: Vec<LogEvent> = output.lines().filter_map(parse_compact_line).collect();
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let events = BufReader::new(stdout)
+        .split(b'\n')
+        .map_while(Result::ok)
+        .filter_map(|line| parse_compact_line(&String::from_utf8_lossy(&line)));
 
-    match format {
-        OutputFormat::Json => {
-            let items: Vec<String> = events.iter().map(event_json).collect();
-            println!("[{}]", items.join(", "));
-        }
-        OutputFormat::Text => {
-            if events.is_empty() {
-                let unit = if hours == 1 { "hour" } else { "hours" };
-                println!("no memory events in last {hours} {unit}");
-            } else {
-                println!("{:<9} {:<9} DETAIL", "TIME", "TYPE");
-                let mut prev_date: Option<&str> = None;
-                for e in &events {
-                    if prev_date != Some(e.date.as_str()) {
-                        println!("-- {} --", e.date);
-                        prev_date = Some(e.date.as_str());
-                    }
-                    println!("{:<9} {:<9} {}", e.time, e.kind.label(), e.message);
+    let mut json_items: Vec<String> = Vec::new();
+    let mut count = 0usize;
+    let mut prev_date: Option<String> = None;
+    for e in events {
+        count += 1;
+        match format {
+            OutputFormat::Json => json_items.push(event_json(&e)),
+            OutputFormat::Text => {
+                if count == 1 {
+                    println!("{:<9} {:<9} DETAIL", "TIME", "TYPE");
                 }
+                if prev_date.as_deref() != Some(e.date.as_str()) {
+                    println!("-- {} --", e.date);
+                    prev_date = Some(e.date.clone());
+                }
+                println!("{:<9} {:<9} {}", e.time, e.kind.label(), e.message);
             }
         }
+    }
+
+    match child.wait() {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!("log show failed ({status})");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("could not wait for /usr/bin/log: {e}");
+            return 1;
+        }
+    }
+    match format {
+        OutputFormat::Json => println!("[{}]", json_items.join(", ")),
+        OutputFormat::Text if count == 0 => {
+            let unit = if hours == 1 { "hour" } else { "hours" };
+            println!("no memory events in last {hours} {unit}");
+        }
+        OutputFormat::Text => {}
     }
     0
 }
@@ -891,21 +865,21 @@ struct Config {
     help: bool,
 }
 
-fn usage() {
-    println!("macswapi [N] [-p|--parent] [-w|--watch|--delta [SECS]]");
-    println!("macswapi -l|--logs [HOURS] [-f|--format text|json]");
-    println!("  N            top N rows (default 20, 0=all)");
-    println!("  -p --parent  add PPID + parent-name columns (works in watch mode too)");
-    println!("  -w --watch   single-interval leak check; SECS must immediately follow the flag");
-    println!("     --delta   clearer alias for --watch (default interval 3s)");
-    println!("               SECS must be positive; N must appear before the interval flag");
-    println!("               example: macswapi 50 --delta 5");
-    println!("  -l --logs    memory-event timeline from the unified log (default 1 hour)");
-    println!("               events: memory-pressure changes, jetsam kills, swapfile lifecycle");
-    println!("               HOURS must be positive and immediately follow the flag");
-    println!("  -f --format  output format for --logs: text (default) or json");
-    println!("  -h --help    this help");
-}
+const USAGE: &str = "\
+macswapi [N] [-p|--parent] [-w|--watch|--delta [SECS]]
+macswapi -l|--logs [HOURS] [-f|--format text|json]
+  N            top N rows (default 20, 0=all)
+  -p --parent  add PPID + parent-name columns (works in watch mode too)
+  -w --watch   single-interval leak check; SECS must immediately follow the flag
+     --delta   clearer alias for --watch (default interval 3s)
+               SECS must be positive; N must appear before the interval flag
+               example: macswapi 50 --delta 5
+  -l --logs    memory-event timeline from the unified log (default 1 hour)
+               events: memory-pressure changes, jetsam kills, swapfile lifecycle
+               HOURS must be positive and immediately follow the flag
+  -f --format  output format for --logs: text (default) or json
+  -h --help    this help
+";
 
 fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut config = Config {
@@ -918,6 +892,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     };
     let mut saw_interval_flag = false;
     let mut saw_format_flag = false;
+    let mut saw_topn = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -977,6 +952,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
                         return Err("N must appear before the interval flag".to_string());
                     }
                     config.topn = topn;
+                    saw_topn = true;
                 } else {
                     return Err(format!("unknown arg: {other}"));
                 }
@@ -990,6 +966,9 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     }
     if saw_format_flag && config.logs_hours.is_none() {
         return Err("--format only applies to --logs".to_string());
+    }
+    if config.logs_hours.is_some() && (saw_topn || config.show_parent) {
+        return Err("N and --parent do not apply to --logs".to_string());
     }
 
     Ok(config)
@@ -1005,13 +984,13 @@ fn main() {
         Ok(config) => config,
         Err(err) => {
             eprintln!("{err}");
-            usage();
+            eprint!("{USAGE}");
             std::process::exit(2);
         }
     };
 
     if config.help {
-        usage();
+        print!("{USAGE}");
         return;
     }
 
@@ -1051,29 +1030,21 @@ mod tests {
     }
 
     #[test]
-    fn test_swap_share() {
-        assert_eq!(swap_share(50.0, 0.0, 1000.0), 0.0); // zero total
-        assert_eq!(swap_share(50.0, 100.0, 1000.0), 500.0); // proportional
-        assert_eq!(swap_share(50.0, 100.0, 0.0), 0.0); // zero swap
-    }
-
-    #[test]
-    fn test_swap_estimates_available_requires_total_and_denominator() {
-        assert!(!swap_estimates_available(None, 100));
-        assert!(!swap_estimates_available(Some(1000), 0));
-        assert!(swap_estimates_available(Some(1000), 1));
+    fn test_swap_ratio() {
+        assert_eq!(swap_ratio(None, 100), None); // swap total unavailable
+        assert_eq!(swap_ratio(Some(1000), 0), None); // zero denominator
+        assert_eq!(swap_ratio(Some(1000), 100), Some(10.0)); // proportional
+        assert_eq!(swap_ratio(Some(0), 100), Some(0.0)); // zero swap
     }
 
     #[test]
     fn test_conservation() {
         let compressed = [10u64, 25, 3, 100, 7, 512, 64, 1];
         let total: u64 = compressed.iter().sum();
-        let swap = 4_294_967_296.0f64; // 4G
-        let sum: f64 = compressed
-            .iter()
-            .map(|&c| swap_share(c as f64, total as f64, swap))
-            .sum();
-        assert!((sum - swap).abs() < 1e-3, "sum={sum} swap={swap}");
+        let swap = 4_294_967_296u64; // 4G
+        let k = swap_ratio(Some(swap), total).unwrap();
+        let sum: f64 = compressed.iter().map(|&c| c as f64 * k).sum();
+        assert!((sum - swap as f64).abs() < 1e-3, "sum={sum} swap={swap}");
     }
 
     #[test]
@@ -1139,6 +1110,13 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_args_rejects_snapshot_options_with_logs() {
+        assert!(parse(&["5", "--logs"]).is_err());
+        assert!(parse(&["--logs", "4", "10"]).is_err()); // 4 = HOURS, 10 = N
+        assert!(parse(&["--logs", "-p"]).is_err());
+    }
+
+    #[test]
     fn test_parse_args_format_requires_logs_and_valid_value() {
         assert_eq!(
             parse(&["--logs", "-f", "json"]).unwrap().format,
@@ -1150,12 +1128,22 @@ mod tests {
         assert!(parse(&["--logs", "--watch", "5"]).is_err()); // mutually exclusive
     }
 
+    // Real kernel messages captured with `log show --style compact`.
+    // KILL_IDLE_DUP is logged ~15ms before KILL_IDLE for the same kill.
+    const KILL_SPECIFIC: &str = "memorystatus: killing_specific_process pid 58521 \
+        [knowledgeconstructiond] (per-process-limit 0 0s rf:- type:daemon) 20192KB - \
+        memorystatus_available_pages: 1820483";
+    const KILL_IDLE: &str = "memorystatus: killing_idle_process pid 414 [sandboxd] \
+        (idle-exit 0 90330s rf:- type:daemon) 3168KB - memorystatus_available_pages: 789885 \
+        compressor_size:795015";
+    const KILL_IDLE_DUP: &str = "memorystatus: killing (idle) sandboxd [414] due to idle-exit (9)";
+
     #[test]
     fn test_classify_event() {
-        assert_eq!(
-            classify_event("memorystatus: killing_specific_process pid 812 [Xcode]"),
-            Some(EventKind::Jetsam)
-        );
+        assert_eq!(classify_event(KILL_SPECIFIC), Some(EventKind::Jetsam));
+        assert_eq!(classify_event(KILL_IDLE), Some(EventKind::Jetsam));
+        // duplicate of KILL_IDLE: skipped so each kill is reported once
+        assert_eq!(classify_event(KILL_IDLE_DUP), None);
         // noise: memorystatus but no kill
         assert_eq!(
             classify_event("memorystatus: Denying dirty-tracking opt-in for managed VPN [15607]"),
@@ -1180,8 +1168,12 @@ mod tests {
     #[test]
     fn test_extract_jetsam() {
         assert_eq!(
-            extract_jetsam("memorystatus: killing_specific_process pid 812 [Xcode] (limit) 45MB"),
-            (Some(812), Some("Xcode".to_string()))
+            extract_jetsam(KILL_SPECIFIC),
+            (Some(58521), Some("knowledgeconstructiond".to_string()))
+        );
+        assert_eq!(
+            extract_jetsam(KILL_IDLE),
+            (Some(414), Some("sandboxd".to_string()))
         );
         // "process N" form, name in brackets, no "pid" token
         assert_eq!(
@@ -1194,14 +1186,18 @@ mod tests {
 
     #[test]
     fn test_parse_compact_line() {
-        let line =
-            "2026-07-15 14:24:01.804 Df kernel[0:9a59c] memorystatus: killing process 812 [Xcode]";
-        let e = parse_compact_line(line).unwrap();
-        assert_eq!(e.date, "2026-07-15");
-        assert_eq!(e.time, "14:24:01"); // ms stripped
+        let line = format!("2026-10-21 20:09:19.943 Df kernel[0:877] {KILL_IDLE}");
+        let e = parse_compact_line(&line).unwrap();
+        assert_eq!(e.date, "2026-10-21");
+        assert_eq!(e.time, "20:09:19"); // ms stripped
         assert_eq!(e.kind, EventKind::Jetsam);
-        assert_eq!(e.pid, Some(812));
-        assert_eq!(e.process.as_deref(), Some("Xcode"));
+        assert_eq!(e.pid, Some(414));
+        assert_eq!(e.process.as_deref(), Some("sandboxd"));
+        assert_eq!(e.message, KILL_IDLE);
+
+        // the idle-kill duplicate yields no event
+        let dup = format!("2026-10-21 20:09:19.929 Df kernel[0:877] {KILL_IDLE_DUP}");
+        assert!(parse_compact_line(&dup).is_none());
 
         // header and noise → None
         assert!(parse_compact_line("Timestamp               Ty Process[PID:TID]").is_none());

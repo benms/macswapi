@@ -33,10 +33,12 @@ Text output:
 
 ```
 TIME      TYPE      DETAIL
-14:02:11  pressure  system memory pressure changed: normal → warn
-14:02:15  swapfile  swapfile created: /private/var/vm/swapfile1
-14:03:40  jetsam    killed pid 812 (Xcode) footprint 4.2G — idle-exit
+-- 2026-10-21 --
+10:14:14  jetsam    memorystatus: killing_specific_process pid 58521 [knowledgeconstructiond] (per-process-limit 0 0s rf:- type:daemon) 20192KB - memorystatus_available_pages: 1820483
+20:09:19  jetsam    memorystatus: killing_idle_process pid 414 [sandboxd] (idle-exit 0 90330s rf:- type:daemon) 3168KB - memorystatus_available_pages: 789885 compressor_size:795015
 ```
+
+DETAIL is the raw kernel message.
 
 JSON output: array of objects, one per event:
 
@@ -70,11 +72,14 @@ log show --last <N>h --style compact --predicate '<compound>'
 
 The predicate matches kernel/memorystatus senders and swap/pressure/jetsam
 keywords. Each output line is keyword-classified into one of the three event
-types; jetsam lines additionally get pid + process name extracted. The
+types; jetsam lines additionally get pid + process name extracted. The kernel
+logs each idle kill twice (`killing (idle) NAME [PID] …` then
+`killing_idle_process pid PID [NAME] …`); the first form is skipped. The
 kernel's message text is otherwise passed through raw — deliberately shallow
 parsing, so message-format drift across macOS versions degrades gracefully
-(a matched-but-unrecognized line still prints, minus extracted fields).
-Events print in log order (already chronological).
+(if pid/name extraction fails, the event still prints, minus those fields).
+Events print in log order (already chronological). Text output streams as
+`log show` produces lines; JSON prints once the query finishes.
 
 Spawning `/usr/bin/log` (a platform binary) is in the same spirit as the
 existing sysctl calls; no crates added.
