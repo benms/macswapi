@@ -23,7 +23,7 @@ use crate::table::{
     arrange, csv_header, cut, render_csv, render_csv_rows, render_table, Layout, ParentNames, Row,
     RowSrc, Trend,
 };
-use crate::term::{color_enabled, emit_raw, term_rows, wait_key, Screen};
+use crate::term::{color_enabled, emit_raw, read_key, term_rows, Key, Screen};
 
 /// Exit status of `--exit-on-alert` when a rule fires.
 pub(crate) const ALERT_EXIT: i32 = 3;
@@ -269,7 +269,7 @@ pub(crate) enum Wake {
     /// q, or a stop signal
     Quit,
     /// any other key
-    Key(u8),
+    Key(Key),
 }
 
 /// Waits until `deadline` (for ever while `paused`), watching for keys when
@@ -280,13 +280,13 @@ pub(crate) fn wait_until(deadline: Instant, paused: bool, keys: bool) -> Wake {
             return Wake::Quit;
         }
         let key = if keys {
-            wait_key(100)
+            read_key(100)
         } else {
             std::thread::sleep(Duration::from_millis(100));
             None
         };
         match key {
-            Some(b'q' | b'Q') => return Wake::Quit,
+            Some(Key::Char(b'q' | b'Q')) => return Wake::Quit,
             Some(k) => return Wake::Key(k),
             None => {}
         }
@@ -464,7 +464,7 @@ pub fn run_watch(config: &Config, filter: &Filter, interval: u64) {
             match wait_until(deadline, paused, keys) {
                 Wake::Tick => break,
                 Wake::Quit => break 'run,
-                Wake::Key(b' ') => {
+                Wake::Key(Key::Char(b' ')) => {
                     paused = !paused;
                     show(&status_line(interval, tick, paused, keys), &frame, tty);
                 }

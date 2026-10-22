@@ -150,8 +150,10 @@ trend columns. `--csv` with `--watch` streams instead of drawing (see
 `-T`/`--top [SECS]` is a one-screen dashboard in the manner of Mole's
 `mo status`, refreshed every SECS (default 2) until `q`. Space pauses, `a`
 switches the first process card between apps (grouped as with `-a`) and single
-processes, and `?` or `h` shows a help page with the keys, the verdict order
-and what each card means (any key goes back; sampling goes on behind it):
+processes, `↑`/`↓` (or `j`/`k`) select an app and Enter opens it to list its
+processes under it (`→`/`←` open and close, Esc unselects), and `?` or `h`
+shows a help page with the keys, the verdict order and what each card means
+(any key goes back; sampling goes on behind it):
 
 ```
 macswapi top · 32.00G RAM · up 2h47m · pressure ● normal (74%) · all clear
@@ -175,7 +177,7 @@ Code ×31               ▮▮▮▯▯    3.64G ▄▁▁▁▁▁▁▁     Co
 OrbStack Helper 87953  ▮▯▯▯▯    1.81G ▁▁▁▁▁▁▁▁     Jetsam nearest: WallpaperAgent 653, 9.44M left
 Claude ×16             ▮▯▯▯▯    1.10G ▁▁▁▁▁▁▁▁
 
-space pause · a apps/processes · ? help · q quit · every 2s · refresh #8
+space pause · ↑↓ select · ⏎ open · a apps/processes · ? help · q quit · every 2s · refresh #8
 ```
 
 - The header ends with a verdict, the first that applies of: memory pressure
@@ -189,7 +191,9 @@ space pause · a apps/processes · ? help · q quit · every 2s · refresh #8
   **Pressure**: the kernel's level and available percentage over time, swap
   traffic since boot, and how many processes were readable.
 - **Apps by footprint** (or processes, with `a`): `▮` bars relative to the
-  largest, and each row's `TREND`. **Growing**: processes whose footprint grew
+  largest, and each row's `TREND`. The selected app is highlighted and the
+  list scrolls to keep it in view; an opened app lists up to 8 of its
+  processes, largest first, their bars a share of the app. **Growing**: processes whose footprint grew
   over the interval, those growing every interval (`GREW%` 100, yellow) first,
   then the process closest to its jetsam limit.
 - Wider than 80 columns, cards go in pairs; narrower, in one column. The
@@ -413,7 +417,7 @@ sudo macswapi 20 -p                 # system-wide + parents
 sudo macswapi 20 -x                 # + peaks, decompressions, jetsam headroom
 sudo macswapi 10 -t                 # top 10 process trees, rolled up
 macswapi 10 -a                      # top 10 apps, XPC helpers included
-macswapi -T                         # the dashboard; a: apps/processes, ?: help
+macswapi -T                         # the dashboard; ↑↓ ⏎: open an app, ?: help
 sudo macswapi -T 5                  # every process, refreshed every 5s
 macswapi --name chrome --sort foot  # Chrome processes by footprint
 macswapi 5 --sort headroom          # closest to a jetsam kill

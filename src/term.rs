@@ -80,3 +80,58 @@ pub fn wait_key(timeout_ms: c_int) -> Option<u8> {
     let n = unsafe { read(0, &mut key as *mut u8 as *mut c_void, 1) };
     (n == 1).then_some(key)
 }
+
+/// A key press, arrow keys decoded from their escape sequences.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    Char(u8),
+    Up,
+    Down,
+    Left,
+    Right,
+    Esc,
+}
+
+/// The key that starts with byte `first`, reading the rest of an escape
+/// sequence from `next`. Sequences other than arrows read as Esc.
+fn decode(first: u8, next: &mut dyn FnMut() -> Option<u8>) -> Key {
+    if first != 0x1b {
+        return Key::Char(first);
+    }
+    if !matches!(next(), Some(b'[' | b'O')) {
+        return Key::Esc;
+    }
+    match next() {
+        Some(b'A') => Key::Up,
+        Some(b'B') => Key::Down,
+        Some(b'C') => Key::Right,
+        Some(b'D') => Key::Left,
+        _ => Key::Esc,
+    }
+}
+
+/// The next key pressed within `timeout_ms`, if any.
+pub fn read_key(timeout_ms: c_int) -> Option<Key> {
+    let first = wait_key(timeout_ms)?;
+    Some(decode(first, &mut || wait_key(10)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_keys() {
+        let d = |bytes: &[u8]| {
+            let mut rest = bytes[1..].iter().copied();
+            decode(bytes[0], &mut || rest.next())
+        };
+        assert_eq!(d(b"a"), Key::Char(b'a'));
+        assert_eq!(d(b"\x1b[A"), Key::Up);
+        assert_eq!(d(b"\x1bOB"), Key::Down);
+        assert_eq!(d(b"\x1b[C"), Key::Right);
+        assert_eq!(d(b"\x1b[D"), Key::Left);
+        assert_eq!(d(b"\x1b"), Key::Esc);
+        assert_eq!(d(b"\x1b[Z"), Key::Esc);
+    }
+}

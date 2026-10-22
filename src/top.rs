@@ -2,7 +2,8 @@
 //! memory, compressor, swap and pressure cards over the biggest apps and the
 //! growing processes, two columns on a wide terminal, refreshed every interval.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::os::raw::c_int;
 use std::time::{Duration, Instant};
 
 use crate::alert::{Alerts, Firing};
@@ -12,7 +13,7 @@ use crate::format::{duration_str, human, human_signed, sparkline};
 use crate::sample::{sample, swap_denominator, Filter, SampleSet};
 use crate::summary::{pressure_name, uptime_secs, SysMem};
 use crate::table::{arrange, Col, Layout, Row, SortBy};
-use crate::term::{color_enabled, emit_raw, term_cols, term_rows, Screen};
+use crate::term::{color_enabled, emit_raw, term_cols, term_rows, Key, Screen};
 use crate::watch::{
     catch_stop_signals, draw, interval_rows, notify_new, record, swapin_culprits, wait_until,
     History, Wake, ALERT_EXIT,
@@ -25,6 +26,8 @@ const WIDE: usize = 80;
 /// Rows the apps card starts from before shrinking to the window.
 const APP_ROWS: usize = 10;
 const GROW_ROWS: usize = 4;
+/// Most processes listed under an opened app.
+const OPEN_ROWS: usize = 8;
 /// Sustained growth slower than this (bytes/s) stays out of the header.
 const GROWER_MIN: f64 = 1024.0 * 1024.0;
 
@@ -37,6 +40,7 @@ const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
 const BANNER: &str = "\x1b[1;30;43m";
+const REVERSE: &str = "\x1b[7m";
 
 /// Wraps text in an SGR color when color is on.
 #[derive(Clone, Copy)]
@@ -186,6 +190,91 @@ impl SysHist {
     }
 }
 
+/// PIDs of the apps (top-level rows) in `apps`, in order.
+fn roots(apps: &[Row]) -> Vec<c_int> {
+    apps.iter()
+        .filter(|r| r.depth == 0)
+        .map(|r| r.pid)
+        .collect()
+}
+
+/// The app selected in the apps card and the apps opened to show their
+/// processes, kept by PID so they follow the apps as rows re-sort.
+#[derive(Default)]
+struct Pick {
+    /// the selected app, while a selection is on
+    sel: Option<c_int>,
+    /// its index when last seen, the selection's place once the app exits
+    at: usize,
+    open: HashSet<c_int>,
+}
+
+impl Pick {
+    /// Index of the selected app in `roots`, or of the one now in its place.
+    fn index(&self, roots: &[c_int]) -> Option<usize> {
+        let pid = self.sel?;
+        let last = roots.len().checked_sub(1)?;
+        Some(
+            roots
+                .iter()
+                .position(|&p| p == pid)
+                .unwrap_or(self.at.min(last)),
+        )
+    }
+
+    /// Follows the apps in a new sample: the selection moves to whichever app
+    /// took the place of one that exited, and exited apps close.
+    fn sync(&mut self, roots: &[c_int]) {
+        if let Some(i) = self.index(roots) {
+            self.sel = Some(roots[i]);
+            self.at = i;
+        }
+        self.open.retain(|p| roots.contains(p));
+    }
+
+    /// Acts on a selection key; false if `k` isn't one.
+    fn key(&mut self, k: Key, roots: &[c_int]) -> bool {
+        self.sync(roots);
+        let i = self.index(roots);
+        match k {
+            Key::Down | Key::Char(b'j') | Key::Up | Key::Char(b'k') => {
+                let Some(last) = roots.len().checked_sub(1) else {
+                    return true;
+                };
+                let down = matches!(k, Key::Down | Key::Char(b'j'));
+                let j = match i {
+                    None => 0,
+                    Some(i) if down => (i + 1).min(last),
+                    Some(i) => i.saturating_sub(1),
+                };
+                self.sel = Some(roots[j]);
+                self.at = j;
+            }
+            Key::Char(b'\n' | b'\r') | Key::Right | Key::Left => {
+                if let Some(i) = i {
+                    let pid = roots[i];
+                    match k {
+                        Key::Right => {
+                            self.open.insert(pid);
+                        }
+                        Key::Left => {
+                            self.open.remove(&pid);
+                        }
+                        _ => {
+                            if !self.open.remove(&pid) {
+                                self.open.insert(pid);
+                            }
+                        }
+                    }
+                }
+            }
+            Key::Esc => self.sel = None,
+            _ => return false,
+        }
+        true
+    }
+}
+
 /// One interval's samples and the rows made from them.
 struct Snap {
     sys0: SysMem,
@@ -208,6 +297,7 @@ struct Ctx<'a> {
     hist: &'a SysHist,
     alerts: &'a Alerts,
     show_apps: bool,
+    pick: &'a Pick,
     /// fixed apps-card rows (N given), else sized to the window
     rows: Option<usize>,
     interval: u64,
@@ -234,6 +324,7 @@ impl Fixed<'_> {
         hist: &'b SysHist,
         alerts: &'b Alerts,
         show_apps: bool,
+        pick: &'b Pick,
         tick: u64,
         paused: bool,
     ) -> Ctx<'b> {
@@ -253,6 +344,7 @@ impl Fixed<'_> {
             hist,
             alerts,
             show_apps,
+            pick,
             rows: self.rows,
             interval: self.interval,
             tick,
@@ -534,47 +626,99 @@ fn pressure_card(snap: &Snap, hist: &SysHist, paint: Paint) -> Card {
     }
 }
 
+/// One row of the apps card: name (with ×N for a group, else the PID),
+/// footprint bar against `peak`, footprint and trend, in `w` columns.
+fn app_line(layout: &Layout, r: &Row, peak: f64, indent: usize, w: usize, paint: Paint) -> String {
+    let foot = val(layout, r, Col::Foot1).unwrap_or(0.0);
+    let procs = val(layout, r, Col::Procs).unwrap_or(1.0);
+    let right = format!(
+        " {} {:>8} {}",
+        paint.p(CYAN, &bar(foot / peak.max(1.0), 5, '▮', '▯')),
+        human(foot),
+        fit(&sparkline(&r.hist), 11)
+    );
+    let nw = w.saturating_sub(width(&right));
+    let pad = "  ".repeat(indent);
+    let name = if procs > 1.0 {
+        fit(&format!("{pad}{} ×{procs:.0}", r.name), nw)
+    } else {
+        name_pid(&format!("{pad}{}", r.name), r.pid, nw)
+    };
+    format!("{name}{right}")
+}
+
+/// The apps card's rows from the selected app's: reversed with color,
+/// else marked with "›".
+fn selected_line(layout: &Layout, r: &Row, peak: f64, w: usize, paint: Paint) -> String {
+    if paint.0 {
+        let line = app_line(layout, r, peak, 0, w, Paint(false));
+        paint.p(REVERSE, &fit(&line, w))
+    } else {
+        format!(
+            "› {}",
+            app_line(layout, r, peak, 0, w.saturating_sub(2), paint)
+        )
+    }
+}
+
+/// Apps (or processes) by footprint. In apps mode the list scrolls to keep
+/// the selected app in view, and an opened app lists its processes under it,
+/// their bars a share of the app.
 fn apps_card(snap: &Snap, cx: &Ctx, cw: usize, n: usize) -> Card {
     let layout = cx.layout;
-    let rows: Vec<&Row> = if cx.show_apps {
-        snap.apps.iter().filter(|r| r.depth == 0).take(n).collect()
-    } else {
-        snap.procs.iter().take(n).collect()
-    };
-    let peak = rows
-        .first()
-        .and_then(|r| val(layout, r, Col::Foot1))
-        .unwrap_or(1.0)
-        .max(1.0);
+    let foot = |r: &Row| val(layout, r, Col::Foot1).unwrap_or(0.0);
     let mut lines = Vec::new();
-    for r in &rows {
-        let foot = val(layout, r, Col::Foot1).unwrap_or(0.0);
-        let procs = val(layout, r, Col::Procs).unwrap_or(1.0);
-        let right = format!(
-            " {} {:>8} {}",
-            cx.paint.p(CYAN, &bar(foot / peak, 5, '▮', '▯')),
-            human(foot),
-            fit(&sparkline(&r.hist), 11)
-        );
-        let nw = cw.saturating_sub(width(&right));
-        let name = if procs > 1.0 {
-            fit(&format!("{} ×{procs:.0}", r.name), nw)
-        } else {
-            name_pid(&r.name, r.pid, nw)
-        };
-        lines.push(format!("{name}{right}"));
+    let mut title = String::from("Processes by footprint");
+    if cx.show_apps {
+        title = String::from("Apps by footprint");
+        let apps = &snap.apps;
+        let roots: Vec<usize> = (0..apps.len()).filter(|&i| apps[i].depth == 0).collect();
+        let pids: Vec<c_int> = roots.iter().map(|&i| apps[i].pid).collect();
+        let sel = cx.pick.index(&pids);
+        let start = sel.map_or(0, |i| (i + 1).saturating_sub(n));
+        let shown = &roots[start..(start + n).min(roots.len())];
+        if start > 0 {
+            title += &format!(
+                " · {}–{} of {}",
+                start + 1,
+                start + shown.len(),
+                roots.len()
+            );
+        }
+        let peak = roots.first().map_or(1.0, |&i| foot(&apps[i]));
+        for (k, &i) in shown.iter().enumerate() {
+            let r = &apps[i];
+            lines.push(if sel == Some(start + k) {
+                selected_line(layout, r, peak, cw, cx.paint)
+            } else {
+                app_line(layout, r, peak, 0, cw, cx.paint)
+            });
+            if !cx.pick.open.contains(&r.pid) {
+                continue;
+            }
+            let kids = apps[i + 1..].iter().take_while(|c| c.depth > 0);
+            let total = kids.clone().count();
+            for c in kids.take(OPEN_ROWS) {
+                lines.push(app_line(layout, c, foot(r), c.depth, cw, cx.paint));
+            }
+            if total > OPEN_ROWS {
+                let more = format!("  … +{} more", total - OPEN_ROWS);
+                lines.push(cx.paint.p(DIM, &more));
+            }
+        }
+    } else {
+        let rows = &snap.procs[..n.min(snap.procs.len())];
+        let peak = rows.first().map_or(1.0, foot);
+        for r in rows {
+            lines.push(app_line(layout, r, peak, 0, cw, cx.paint));
+        }
     }
     if lines.is_empty() {
         lines.push(cx.paint.p(DIM, "no process matches"));
     }
-    let title = if cx.show_apps {
-        "Apps by footprint"
-    } else {
-        "Processes by footprint"
-    };
     Card {
         icon: "❊",
-        title: title.to_string(),
+        title,
         lines,
     }
 }
@@ -671,13 +815,21 @@ fn header(snap: &Snap, cx: &Ctx) -> String {
 
 fn footer(cx: &Ctx) -> String {
     let keys = match (cx.keys, cx.paused) {
-        (true, false) => "space pause · a apps/processes · ? help · q quit",
-        (true, true) => "PAUSED · space resume · a apps/processes · ? help · q quit",
+        (true, false) => "space pause",
+        (true, true) => "PAUSED · space resume",
         (false, _) => "Ctrl-C quit",
+    };
+    let more = match (cx.keys, cx.show_apps) {
+        (true, true) => " · ↑↓ select · ⏎ open · a apps/processes · ? help · q quit",
+        (true, false) => " · a apps/processes · ? help · q quit",
+        (false, _) => "",
     };
     cx.paint.p(
         DIM,
-        &format!("{keys} · every {}s · refresh #{}", cx.interval, cx.tick),
+        &format!(
+            "{keys}{more} · every {}s · refresh #{}",
+            cx.interval, cx.tick
+        ),
     )
 }
 
@@ -694,6 +846,8 @@ fn help_page(paint: Paint, width: usize) -> String {
         head("Keys"),
         "  space  pause, resume      a  apps / processes      ? h  this help      q  quit"
             .to_string(),
+        "  ↑↓ j k  select an app     ⏎ → ←  open, close its processes      esc  unselect"
+            .to_string(),
         String::new(),
         head("Header verdict: the first that applies"),
         "  memory pressure critical › swapping in: who › an --alert firing ›".to_string(),
@@ -707,6 +861,7 @@ fn help_page(paint: Paint, width: usize) -> String {
         "  Pressure    the kernel's level and % available over time; swap since boot".to_string(),
         "  Apps        footprint of apps with their helpers (×N processes); a: per proc"
             .to_string(),
+        "              an opened app lists its processes, bars as a share of the app".to_string(),
         "  Growing     footprint growth this interval; yellow: grew every interval".to_string(),
         "              Jetsam nearest: least memory left before macOS kills a process".to_string(),
         String::new(),
@@ -804,6 +959,7 @@ pub fn run_top(config: &Config, filter: &Filter, interval: u64) {
     let mut sys_hist = SysHist::default();
     let mut last: Option<Snap> = None;
     let (mut paused, mut show_apps, mut help, mut tick) = (false, true, false, 0u64);
+    let mut pick = Pick::default();
     let mut text = format!("macswapi top · waiting {interval}s for the first interval…");
     if tty {
         draw(&text, tty);
@@ -829,16 +985,20 @@ pub fn run_top(config: &Config, filter: &Filter, interval: u64) {
                     match k {
                         // On the help page any key goes back (q quits).
                         _ if help => help = false,
-                        b'?' | b'h' | b'H' => help = true,
-                        b' ' => paused = !paused,
-                        b'a' | b'A' => show_apps = !show_apps,
+                        Key::Char(b'?' | b'h' | b'H') => help = true,
+                        Key::Char(b' ') => paused = !paused,
+                        Key::Char(b'a' | b'A') => show_apps = !show_apps,
+                        k if show_apps
+                            && last.as_ref().is_some_and(|s| pick.key(k, &roots(&s.apps))) => {}
                         _ => continue,
                     }
                     if help {
-                        let width = fixed.ctx(&sys_hist, &alerts, show_apps, tick, paused).width;
+                        let width = fixed
+                            .ctx(&sys_hist, &alerts, show_apps, &pick, tick, paused)
+                            .width;
                         draw(&help_page(paint, width), tty);
                     } else if let Some(snap) = &last {
-                        let cx = fixed.ctx(&sys_hist, &alerts, show_apps, tick, paused);
+                        let cx = fixed.ctx(&sys_hist, &alerts, show_apps, &pick, tick, paused);
                         text = frame(snap, &cx);
                         draw(&text, tty);
                     } else {
@@ -869,6 +1029,7 @@ pub fn run_top(config: &Config, filter: &Filter, interval: u64) {
             &layout,
             &flat_cfg,
         );
+        pick.sync(&roots(&apps));
         let elapsed = b.at.duration_since(a.at).as_secs_f64();
         let firing = alerts.update(t, elapsed, &layout, &apps, sys1.pressure());
         let snap = Snap {
@@ -880,7 +1041,7 @@ pub fn run_top(config: &Config, filter: &Filter, interval: u64) {
             procs,
             firing,
         };
-        let cx = fixed.ctx(&sys_hist, &alerts, show_apps, tick, paused);
+        let cx = fixed.ctx(&sys_hist, &alerts, show_apps, &pick, tick, paused);
         text = frame(&snap, &cx);
         // Samples go on behind the help page, so the cards are current on return.
         if help {
@@ -1012,6 +1173,107 @@ mod tests {
         let narrow = lay_out(&cards, 60, Paint(false));
         assert_eq!(narrow.len(), 3 + 1 + 2 + 1 + 2); // one column
         assert!(narrow.iter().all(|l| width(l) <= 60));
+    }
+
+    #[test]
+    fn test_pick_follows_apps() {
+        let mut pick = Pick::default();
+        assert!(pick.key(Key::Down, &[10, 20, 30])); // first move: top app
+        assert_eq!(pick.sel, Some(10));
+        pick.key(Key::Char(b'j'), &[10, 20, 30]);
+        pick.key(Key::Down, &[10, 20, 30]);
+        pick.key(Key::Down, &[10, 20, 30]); // stays on the last
+        assert_eq!(pick.sel, Some(30));
+        pick.key(Key::Char(b'\n'), &[10, 20, 30]);
+        assert!(pick.open.contains(&30));
+        // re-sorted: the selection follows the app
+        assert_eq!(pick.index(&[30, 10, 20]), Some(0));
+        pick.sync(&[30, 10, 20]);
+        pick.key(Key::Up, &[30, 10, 20]);
+        assert_eq!(pick.sel, Some(30)); // stays on the first
+                                        // the app exits: its place is selected and it closes
+        pick.sync(&[10, 20]);
+        assert_eq!((pick.sel, pick.open.len()), (Some(10), 0));
+        pick.key(Key::Right, &[10, 20]);
+        assert!(pick.open.contains(&10));
+        pick.key(Key::Left, &[10, 20]);
+        assert!(pick.open.is_empty());
+        pick.key(Key::Esc, &[10, 20]);
+        assert_eq!(pick.index(&[10, 20]), None);
+        assert!(!pick.key(Key::Char(b'x'), &[10, 20]));
+    }
+
+    #[test]
+    fn test_apps_card_opens_and_scrolls() {
+        let layout = Layout {
+            cols: vec![Col::Procs, Col::Foot1],
+            visible: vec![0, 1],
+        };
+        let r = |pid, depth, procs: f64, foot: f64| {
+            let mut row = crate::table::tests::row(pid, 1, &[Some(procs), Some(foot)]);
+            row.depth = depth;
+            row
+        };
+        let mut apps = vec![r(1, 0, 11.0, 1100.0)];
+        apps.extend((0..10).map(|k| r(100 + k, 1, 1.0, 100.0)));
+        apps.extend((2..6).map(|pid| r(pid, 0, 1.0, 10.0)));
+        let sys = SysMem::read();
+        let set = || SampleSet {
+            procs: std::collections::HashMap::new(),
+            denied: 0,
+            at: Instant::now(),
+        };
+        let snap = Snap {
+            sys0: SysMem::read(),
+            sys1: sys,
+            a: set(),
+            b: set(),
+            apps,
+            procs: Vec::new(),
+            firing: Vec::new(),
+        };
+        let (hist, alerts) = (SysHist::default(), Alerts::new(&[], 0));
+        let mut pick = Pick::default();
+        let card_of = |pick: &Pick| {
+            let cx = Ctx {
+                paint: Paint(false),
+                width: 60,
+                height: usize::MAX,
+                layout: &layout,
+                hist: &hist,
+                alerts: &alerts,
+                show_apps: true,
+                pick,
+                rows: None,
+                interval: 2,
+                tick: 1,
+                paused: false,
+                keys: true,
+            };
+            apps_card(&snap, &cx, 60, 3)
+        };
+        let card = card_of(&pick);
+        assert_eq!(card.lines.len(), 3);
+        assert!(card.lines[0].starts_with("p1 ×11"));
+
+        let roots = roots(&snap.apps);
+        pick.key(Key::Down, &roots);
+        pick.key(Key::Char(b'\n'), &roots);
+        let card = card_of(&pick);
+        assert!(card.lines[0].starts_with("› p1 ×11"));
+        assert!(card.lines[1].starts_with("  p100 100"));
+        assert_eq!(card.lines[OPEN_ROWS + 1], "  … +2 more");
+        assert!(card.lines[OPEN_ROWS + 2].starts_with("p2 2"));
+        assert_eq!(card.lines.len(), 1 + OPEN_ROWS + 1 + 2);
+        assert!(card.lines.iter().all(|l| width(l) <= 60));
+
+        // the list scrolls to keep the selection in view
+        for _ in 0..4 {
+            pick.key(Key::Down, &roots);
+        }
+        let card = card_of(&pick);
+        assert_eq!(card.title, "Apps by footprint · 3–5 of 5");
+        assert!(card.lines[2].starts_with("› p5 5"));
     }
 
     #[test]
