@@ -10,8 +10,8 @@ Prints, per process:
 - with `-x`: lifetime peaks, decompression count, and jetsam-limit headroom
 
 plus a system memory summary on top, and modes in the spirit of Process
-Explorer: a process tree with subtree rollups (`-t`), a live view that flags
-sustained growth (`--live`), a one-process detail page (`--pid`), sorting and
+Explorer: a process tree with subtree rollups (`-t`), a live watch that flags
+sustained growth (`-w`), a one-process detail page (`--pid`), sorting and
 filtering, and CSV output.
 
 ## Why estimated swap?
@@ -101,13 +101,11 @@ The compressor ratio (uncompressed data held ÷ space it occupies) is a
 system-wide average; the SWAP~ estimate implicitly gives every process this one
 ratio (see caveats).
 
-**Watch** (`-w`/`--delta [SECS]`): two samples SECS apart (default 3), sorted by
-footprint growth. Adds a line of system rates over the interval, the bytes
-swapped in during it, and which processes started or exited (a reused PID is
-one of each).
-
-**Live** (`-l`/`--live [SECS]`): watch, refreshed every SECS (default 2) until
-`q` or Ctrl-C; space pauses. Two more columns track the last 10 intervals:
+**Watch** (`-w`/`--watch [SECS]`): samples every SECS (default 2) until `q` or
+Ctrl-C, sorted by footprint growth over the last interval; space pauses. Adds a
+line of system rates over the interval, the bytes swapped in during it, and
+which processes started or exited (a reused PID is one of each). Two more
+columns track the last 10 intervals:
 
 | column | meaning |
 |---|---|
@@ -116,6 +114,10 @@ one of each).
 
 On a terminal it draws in place on the alternate screen and leaves the last
 frame behind on exit; piped, it appends one frame per refresh.
+
+`--once [SECS]` watches a single interval, prints it and exits, without the
+trend columns. `--csv` in watch mode does the same. `-l`/`--live` and `--delta`
+are aliases of `--watch`.
 
 **Detail** (`--pid PID`): everything readable about one process: the full
 `task_vm_info` breakdown with peaks, the purgeable and network/media/graphics/neural
@@ -128,14 +130,14 @@ Rows nest under their parent process, and each row's values cover its whole
 subtree, like `du`: Chrome's line holds all of its helpers, and `PROCS` counts
 them. Children of launchd (pid 1) are the roots, since rolling everything into
 launchd would hide every app. `N` keeps the top N trees, each shown in full.
-Peaks, `HEADROOM`, and the live trend columns don't add up, so they are blank on
+Peaks, `HEADROOM`, and the watch trend columns don't add up, so they are blank on
 rows that have children.
 
 ### Sort and filter
 
 - `--sort KEY` — snapshot: `cmprs` (default) `swap` `foot` `swapins` `peak`
-  `cpeak` `decomp` `headroom`; watch/live: `delta` (default) `foot` `swapins`
-  `decomp` `headroom`, live also `grew`; any mode: `pid` `name`. Largest first,
+  `cpeak` `decomp` `headroom`; watch: `delta` (default) `foot` `swapins`
+  `decomp` `headroom` `grew` (not with `--once`); any mode: `pid` `name`. Largest first,
   except `headroom`: smallest first (closest to a kill), processes without a
   limit last.
 - `--name STR` — names containing STR, any case.
@@ -148,7 +150,7 @@ Filters pick rows only: the SWAP~ denominator still covers every readable proces
 Every column of the mode, whatever `-x` says, as whole numbers (bytes, counts,
 bytes/s); empty means N/A. `headroom` 0 means no limit. With `-t`, a `depth`
 column is added and rows carry subtree totals. No header or footer is printed;
-warnings go to stderr. Not available with `--live`.
+warnings go to stderr. In watch mode it is a single interval, as `--once`.
 
 ## Install
 
@@ -173,17 +175,17 @@ link time → network-free build.
 ## Usage
 
 ```
-macswapi [N] [options] [-w|--watch|--delta [SECS] | -l|--live [SECS] | --pid PID]
+macswapi [N] [options] [-w|--watch [SECS] | --once [SECS] | --pid PID]
 ```
 
 - `N` — top N rows (default 20, `0` = all); with `-t`, top N trees
 - `-p`, `--parent` — add PPID + parent-name columns
-- `-x`, `--extended` — add `FOOT_PK`, `CMPRS_PK`, `DECOMP`, `HEADROOM` (watch: `DECOMP`, `HEADROOM`; live: also `JETSAM_IN`)
+- `-x`, `--extended` — add `FOOT_PK`, `CMPRS_PK`, `DECOMP`, `HEADROOM` (watch: `DECOMP`, `HEADROOM`, and `JETSAM_IN` unless `--once`)
 - `-t`, `--tree` — process trees with subtree rollups
 - `--sort KEY`, `--name STR`, `--user USER` — see [Sort and filter](#sort-and-filter)
 - `--csv` — CSV output
-- `-w`, `--watch [SECS]`, `--delta [SECS]` — single-interval leak check (default 3s)
-- `-l`, `--live [SECS]` — refresh every SECS (default 2s)
+- `-w`, `--watch [SECS]` — leak watch, refreshed every SECS (default 2s); `-l`/`--live`/`--delta` are aliases
+- `--once [SECS]` — watch a single interval and exit
 - `--pid PID` — one-process detail page
 - `-h`, `--help` — usage
 
@@ -198,8 +200,9 @@ sudo macswapi 20 -x                 # + peaks, decompressions, jetsam headroom
 sudo macswapi 10 -t                 # top 10 process trees, rolled up
 macswapi --name chrome --sort foot  # Chrome processes by footprint
 macswapi 5 --sort headroom          # closest to a jetsam kill
-sudo macswapi -w 5                  # leak watch, 5s
-macswapi 30 -t --live               # live trees; space pauses, q quits
+sudo macswapi -w 5                  # leak watch every 5s; space pauses, q quits
+macswapi 30 -t -w                   # watch trees
+sudo macswapi --once 5              # one 5s interval, then exit
 macswapi --pid 872                  # everything about one process
 macswapi 0 --csv > procs.csv        # every process, every column
 ```

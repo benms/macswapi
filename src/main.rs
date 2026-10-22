@@ -922,14 +922,14 @@ enum Col {
     CmprsPeak,
     Decomp,
     Headroom,
-    // watch / live: change over the interval
+    // watch: change over the interval
     Foot0,
     Foot1,
     Delta,
     Rate,
     SwapinsGrowth,
     DecompGrowth,
-    // live: footprint trend over the window
+    // watch (not --once): footprint trend over the window
     Grew,
     JetsamEta,
 }
@@ -945,7 +945,7 @@ const SNAPSHOT_COLS: &[(Col, bool)] = &[
     (Col::Decomp, false),
     (Col::Headroom, false),
 ];
-const WATCH_COLS: &[(Col, bool)] = &[
+const ONCE_COLS: &[(Col, bool)] = &[
     (Col::Foot0, true),
     (Col::Foot1, true),
     (Col::Delta, true),
@@ -954,7 +954,7 @@ const WATCH_COLS: &[(Col, bool)] = &[
     (Col::DecompGrowth, false),
     (Col::Headroom, false),
 ];
-const LIVE_COLS: &[(Col, bool)] = &[
+const WATCH_COLS: &[(Col, bool)] = &[
     (Col::Foot0, true),
     (Col::Foot1, true),
     (Col::Delta, true),
@@ -1034,7 +1034,7 @@ impl Col {
     }
 }
 
-/// Footprint trend of one process in live mode.
+/// Footprint trend of one process in watch mode.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Trend {
     /// share of intervals in the window where the footprint grew, in percent
@@ -1046,7 +1046,7 @@ struct Trend {
 /// What a row's cells are computed from.
 struct RowSrc<'a> {
     now: &'a Proc,
-    /// watch/live: the same process in the previous sample
+    /// watch: the same process in the previous sample
     before: Option<&'a Proc>,
     elapsed: f64,
     swap_per_cmprs: Option<f64>,
@@ -1156,7 +1156,7 @@ enum SortBy {
     Name,
 }
 
-/// --sort keys: (key, snapshot column, watch/live column).
+/// --sort keys: (key, snapshot column, watch column).
 const SORT_KEYS: &[(&str, Option<Col>, Option<Col>)] = &[
     ("cmprs", Some(Col::Cmprs), None),
     ("swap", Some(Col::SwapEst), None),
@@ -1182,7 +1182,7 @@ fn parse_sort(key: &str, mode: Mode) -> Result<SortBy, String> {
         .ok_or_else(|| format!("unknown sort key: {key} (see --help)"))?;
     let col = match mode {
         Mode::Snapshot | Mode::Detail(_) => snapshot,
-        Mode::Watch(_) | Mode::Live(_) => interval,
+        Mode::Watch(_) | Mode::WatchOnce(_) => interval,
     };
     col.filter(|c| mode.cols().iter().any(|(m, _)| m == c))
         .map(SortBy::Col)
@@ -1576,7 +1576,7 @@ fn run_snapshot(config: &Config, filter: &Filter) {
     }
 }
 
-// ---- watch / leak mode ----------------------------------------------------
+// ---- watch --once: a single interval ----------------------------------------
 
 /// Rows for processes present in both samples with the same start time.
 fn interval_rows(
@@ -1609,7 +1609,7 @@ fn interval_rows(
         .collect()
 }
 
-fn run_watch(config: &Config, filter: &Filter, interval: u64) {
+fn run_once(config: &Config, filter: &Filter, interval: u64) {
     let sys0 = SysMem::read();
     let a = sample();
     std::thread::sleep(Duration::from_secs(interval.max(1)));
@@ -1644,7 +1644,7 @@ fn run_watch(config: &Config, filter: &Filter, interval: u64) {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "interval {:.1}s — one interval = allocation churn; trust SUSTAINED growth as leak signal (--live tracks it).",
+        "interval {:.1}s — one interval = allocation churn; trust SUSTAINED growth as leak signal (watch without --once tracks it).",
         elapsed
     );
     let _ = writeln!(
@@ -1666,9 +1666,9 @@ fn run_watch(config: &Config, filter: &Filter, interval: u64) {
     print!("{out}");
 }
 
-// ---- live mode ------------------------------------------------------------
+// ---- watch mode -----------------------------------------------------------
 
-/// Live-mode footprint history window, in intervals.
+/// Watch-mode footprint history window, in intervals.
 const TREND_WINDOW: usize = 10;
 /// Intervals needed before GREW% and JETSAM_IN are shown.
 const TREND_MIN: usize = 3;
@@ -1725,7 +1725,7 @@ fn emit_raw(s: &str) {
     let _ = out.flush();
 }
 
-/// Live mode on a terminal: alternate screen, no cursor, no line wrap (long
+/// Watch mode on a terminal: alternate screen, no cursor, no line wrap (long
 /// rows are clipped), and keys read unbuffered without echo when stdin is a
 /// terminal too. Dropping it restores all of that.
 struct Screen {
@@ -1802,7 +1802,7 @@ fn show(status: &str, frame: &str, tty: bool) {
 }
 
 fn status_line(interval: u64, tick: u64, paused: bool, keys: bool) -> String {
-    let state = if paused { "PAUSED" } else { "live" };
+    let state = if paused { "PAUSED" } else { "watch" };
     let help = match (keys, paused) {
         (true, false) => "space: pause · q: quit",
         (true, true) => "space: resume · q: quit",
@@ -1811,7 +1811,7 @@ fn status_line(interval: u64, tick: u64, paused: bool, keys: bool) -> String {
     format!("macswapi {state} · every {interval}s · refresh #{tick} · {help}")
 }
 
-fn live_frame(
+fn watch_frame(
     config: &Config,
     filter: &Filter,
     sys: (&SysMem, &SysMem),
@@ -1851,7 +1851,7 @@ fn live_frame(
     out
 }
 
-fn run_live(config: &Config, filter: &Filter, interval: u64) {
+fn run_watch(config: &Config, filter: &Filter, interval: u64) {
     for sig in [SIGHUP, SIGINT, SIGTERM] {
         unsafe { signal(sig, request_stop as extern "C" fn(c_int) as usize) };
     }
@@ -1896,7 +1896,7 @@ fn run_live(config: &Config, filter: &Filter, interval: u64) {
         let cur = sample();
         tick += 1;
         record(&mut hist, &cur, t0.elapsed().as_secs_f64());
-        frame = live_frame(config, filter, (&sys, &sys_now), &prev, &cur, &hist);
+        frame = watch_frame(config, filter, (&sys, &sys_now), &prev, &cur, &hist);
         show(&status_line(interval, tick, paused, keys), &frame, tty);
         sys = sys_now;
         prev = cur;
@@ -2121,8 +2121,10 @@ fn run_detail(pid: c_int) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Snapshot,
+    /// refresh every SECS until quit
     Watch(u64),
-    Live(u64),
+    /// --once: a single interval
+    WatchOnce(u64),
     Detail(c_int),
 }
 
@@ -2131,7 +2133,7 @@ impl Mode {
         match self {
             Mode::Snapshot | Mode::Detail(_) => SNAPSHOT_COLS,
             Mode::Watch(_) => WATCH_COLS,
-            Mode::Live(_) => LIVE_COLS,
+            Mode::WatchOnce(_) => ONCE_COLS,
         }
     }
 }
@@ -2153,33 +2155,38 @@ struct Config {
 impl Config {
     fn sort_by(&self) -> SortBy {
         self.sort.unwrap_or(match self.mode {
-            Mode::Watch(_) | Mode::Live(_) => SortBy::Col(Col::Delta),
+            Mode::Watch(_) | Mode::WatchOnce(_) => SortBy::Col(Col::Delta),
             Mode::Snapshot | Mode::Detail(_) => SortBy::Col(Col::Cmprs),
         })
     }
 }
 
 const USAGE: &str = "\
-macswapi [N] [options] [-w|--watch|--delta [SECS] | -l|--live [SECS] | --pid PID]
+macswapi [N] [options] [-w|--watch [SECS] | --once [SECS] | --pid PID]
   N              top N rows (default 20, 0=all); with --tree, top N trees
   -p --parent    add PPID + parent-name columns
   -x --extended  add FOOT_PK, CMPRS_PK, DECOMP, HEADROOM
-                 (watch: DECOMP, HEADROOM; live: also JETSAM_IN)
+                 (watch: DECOMP, HEADROOM, and JETSAM_IN unless --once)
   -t --tree      process trees; each row rolled up over its subtree
      --sort KEY  cmprs swap foot swapins peak cpeak decomp headroom pid name
-                 (watch/live: delta foot swapins decomp headroom pid name,
-                 live also grew; default cmprs, watch/live delta)
+                 (watch: delta foot swapins decomp headroom grew pid name,
+                 grew not with --once; default cmprs, watch delta)
      --name STR  only processes whose name contains STR (any case)
      --user USER only processes of USER (login name or uid)
      --csv       every column of the mode as CSV, raw numbers
-  -w --watch     single-interval leak check (default 3s)
-     --delta     clearer alias for --watch
-  -l --live      refresh every SECS (default 2s); space pauses, q quits
+                 (watch: a single interval, as with --once)
+  -w --watch     leak watch: refresh every SECS (default 2s), GREW% flags
+                 sustained growth; space pauses, q quits
+                 (-l --live and --delta are aliases)
+     --once      watch a single interval (default 2s), print it and exit
      --pid PID   everything macswapi can read about one process
   -h --help      this help
   SECS must be positive and immediately follow its flag; N must appear
-  before the interval flag. example: macswapi 50 --delta 5
+  before the interval flag. example: macswapi 50 --watch 5
 ";
+
+/// --watch / --once interval when SECS is not given.
+const WATCH_SECS: u64 = 2;
 
 fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut config = Config {
@@ -2194,7 +2201,8 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         mode: Mode::Snapshot,
         help: false,
     };
-    let mut interval: Option<(bool, u64)> = None; // (live, secs)
+    let (mut watch, mut once) = (false, false);
+    let mut interval: Option<u64> = None;
     let mut pid: Option<c_int> = None;
     let mut sort: Option<String> = None;
 
@@ -2229,24 +2237,26 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
                     }
                 }
             }
-            "-w" | "--watch" | "--delta" | "-l" | "--live" => {
-                if interval.is_some() {
-                    return Err("only one of --watch/--delta/--live".to_string());
+            "-w" | "--watch" | "--delta" | "-l" | "--live" | "--once" => {
+                let seen = if arg == "--once" { &mut once } else { &mut watch };
+                if *seen {
+                    return Err(format!("{arg} given twice (--delta and --live are --watch)"));
                 }
-                let live = matches!(arg.as_str(), "-l" | "--live");
-                let mut secs = if live { 2 } else { 3 };
+                *seen = true;
                 if let Some(Ok(s)) = args.get(i + 1).map(|a| a.parse::<u64>()) {
                     if s == 0 {
                         return Err("interval must be positive".to_string());
                     }
-                    secs = s;
+                    if interval.is_some() {
+                        return Err("SECS given twice".to_string());
+                    }
+                    interval = Some(s);
                     i += 1;
                 }
-                interval = Some((live, secs));
             }
             other => {
                 if let Ok(topn) = other.parse::<usize>() {
-                    if interval.is_some() {
+                    if watch || once {
                         return Err("N must appear before the interval flag".to_string());
                     }
                     config.topn = topn;
@@ -2258,12 +2268,14 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         i += 1;
     }
 
-    config.mode = match (pid, interval) {
-        (Some(_), Some(_)) => return Err("--pid can't be combined with --watch/--live".to_string()),
-        (Some(p), None) => Mode::Detail(p),
-        (None, Some((true, secs))) => Mode::Live(secs),
-        (None, Some((false, secs))) => Mode::Watch(secs),
-        (None, None) => Mode::Snapshot,
+    let secs = interval.unwrap_or(WATCH_SECS);
+    config.mode = match (pid, watch || once) {
+        (Some(_), true) => return Err("--pid can't be combined with --watch/--once".to_string()),
+        (Some(p), false) => Mode::Detail(p),
+        // CSV is a single table, so it takes a single interval.
+        (None, true) if once || config.csv => Mode::WatchOnce(secs),
+        (None, true) => Mode::Watch(secs),
+        (None, false) => Mode::Snapshot,
     };
     if matches!(config.mode, Mode::Detail(_))
         && (config.tree
@@ -2275,9 +2287,6 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         return Err(
             "--pid shows one process: no --tree, --csv, --sort, --name or --user".to_string(),
         );
-    }
-    if config.csv && matches!(config.mode, Mode::Live(_)) {
-        return Err("--csv can't be combined with --live".to_string());
     }
     config.sort = sort.map(|key| parse_sort(&key, config.mode)).transpose()?;
     Ok(config)
@@ -2314,7 +2323,7 @@ fn main() {
     match config.mode {
         Mode::Snapshot => run_snapshot(&config, &filter),
         Mode::Watch(secs) => run_watch(&config, &filter, secs),
-        Mode::Live(secs) => run_live(&config, &filter, secs),
+        Mode::WatchOnce(secs) => run_once(&config, &filter, secs),
         Mode::Detail(pid) => run_detail(pid),
     }
 }
@@ -2431,9 +2440,19 @@ mod tests {
     #[test]
     fn test_parse_args_modes() {
         assert_eq!(parse(&[]).unwrap().mode, Mode::Snapshot);
-        assert_eq!(parse(&["--live"]).unwrap().mode, Mode::Live(2));
-        assert_eq!(parse(&["5", "-l", "7"]).unwrap().mode, Mode::Live(7));
-        assert_eq!(parse(&["--watch"]).unwrap().mode, Mode::Watch(3));
+        assert_eq!(parse(&["--watch"]).unwrap().mode, Mode::Watch(2));
+        assert_eq!(parse(&["--live"]).unwrap().mode, Mode::Watch(2));
+        assert_eq!(parse(&["5", "-l", "7"]).unwrap().mode, Mode::Watch(7));
+        assert_eq!(parse(&["--once"]).unwrap().mode, Mode::WatchOnce(2));
+        assert_eq!(parse(&["-w", "5", "--once"]).unwrap().mode, Mode::WatchOnce(5));
+        assert_eq!(parse(&["--once", "-w", "5"]).unwrap().mode, Mode::WatchOnce(5));
+        assert_eq!(parse(&["--csv", "-w"]).unwrap().mode, Mode::WatchOnce(2));
+        assert_eq!(parse(&["--once", "5"]).unwrap().mode, Mode::WatchOnce(5));
+        assert_eq!(parse(&["--csv"]).unwrap().mode, Mode::Snapshot);
+        assert!(parse(&["-w", "3", "--once", "5"]).is_err());
+        assert!(parse(&["--once", "--once"]).is_err());
+        assert!(parse(&["--once", "0"]).is_err());
+        assert!(parse(&["--once", "--sort", "foot", "20"]).is_err());
         assert_eq!(parse(&["--pid", "42"]).unwrap().mode, Mode::Detail(42));
         assert!(parse(&["--watch", "--live"]).is_err());
         assert!(parse(&["--pid", "0"]).is_err());
@@ -2459,8 +2478,8 @@ mod tests {
         assert!(parse(&["--pid", "1", "--watch"]).is_err());
         assert!(parse(&["--pid", "1", "--tree"]).is_err());
         assert!(parse(&["--pid", "1", "--name", "x"]).is_err());
-        assert!(parse(&["--csv", "--live"]).is_err());
-        assert!(parse(&["--sort", "delta"]).is_err()); // watch/live only
+        assert!(parse(&["--pid", "1", "--once"]).is_err());
+        assert!(parse(&["--sort", "delta"]).is_err()); // watch only
         assert!(parse(&["--sort", "bogus"]).is_err());
     }
 
@@ -2475,9 +2494,9 @@ mod tests {
             col("swapins", Mode::Watch(3)),
             Ok(SortBy::Col(Col::SwapinsGrowth))
         );
-        assert_eq!(col("foot", Mode::Live(2)), Ok(SortBy::Col(Col::Foot1)));
-        assert_eq!(col("grew", Mode::Live(2)), Ok(SortBy::Col(Col::Grew)));
-        assert!(col("grew", Mode::Watch(3)).is_err());
+        assert_eq!(col("foot", Mode::Watch(2)), Ok(SortBy::Col(Col::Foot1)));
+        assert_eq!(col("grew", Mode::Watch(2)), Ok(SortBy::Col(Col::Grew)));
+        assert!(col("grew", Mode::WatchOnce(3)).is_err());
         assert!(col("peak", Mode::Watch(3)).is_err());
         assert_eq!(col("name", Mode::Watch(3)), Ok(SortBy::Name));
         assert_eq!(col("pid", Mode::Snapshot), Ok(SortBy::Pid));
