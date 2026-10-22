@@ -39,6 +39,9 @@ jobs:
       - name: Unit tests
         run: cargo test --release --locked
 
+      - name: Build
+        run: cargo build --release --locked
+
       - name: Smoke test
         # Runs every mode against the runner's own processes (no sudo). Under
         # pipefail, `|| true` keeps head's SIGPIPE from failing the step.
