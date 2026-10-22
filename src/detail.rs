@@ -10,10 +10,11 @@ use crate::ffi::{
 };
 use crate::format::{duration_str, headroom_str, human, opt_bytes};
 use crate::kernel::{
-    list_pids, pidinfo, proc_display_name, proc_path, rusage, swap_usage, task_vm, task_vm_raw,
-    user_name, VmStats,
+    list_pids, pidinfo, proc_display_name, proc_path, responsible_pid, rusage, swap_usage, task_vm,
+    task_vm_raw, user_name, VmStats,
 };
-use crate::sample::swap_ratio;
+use crate::sample::{swap_denominator, swap_ratio};
+use crate::summary::SysMem;
 
 fn kv(out: &mut String, label: &str, value: impl std::fmt::Display) {
     let _ = writeln!(out, "  {label:<30} {value}");
@@ -54,6 +55,12 @@ pub fn run_detail(pid: c_int) {
             "parent",
             format!("{ppid} ({})", proc_display_name(ppid)),
         );
+        let resp = match responsible_pid(pid) {
+            Some(r) if r == pid => "itself".to_string(),
+            Some(r) => format!("{r} ({})", proc_display_name(r)),
+            None => "?".to_string(),
+        };
+        kv(&mut out, "responsible process", resp);
         let user = user_name(bsd.pbi_uid).unwrap_or_else(|| "?".to_string());
         kv(&mut out, "user", format!("{user} ({})", bsd.pbi_uid));
         if let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -131,7 +138,8 @@ pub fn run_detail(pid: c_int) {
     );
     kv2(&mut out, "regions", &{ info.region_count }.to_string(), "");
 
-    // SWAP~ needs the denominator over every readable process.
+    // SWAP~ needs the denominator: the compressor's whole content, or failing
+    // that, every readable process.
     let (mut all_compressed, mut readable, mut denied) = (0u64, 0usize, 0usize);
     for p in list_pids() {
         match task_vm(p) {
@@ -143,14 +151,23 @@ pub fn run_detail(pid: c_int) {
         }
     }
     let swap_used = swap_usage().ok().map(|x| x.xsu_used);
-    let estimate = swap_ratio(swap_used, all_compressed)
+    let held = SysMem::read().compressor_held();
+    let denominator = swap_denominator(held, all_compressed);
+    let estimate = swap_ratio(swap_used, denominator)
         .map_or_else(|| "N/A".to_string(), |k| human(vm.compressed as f64 * k));
-    let mut note = format!(
-        "share of {} system swap over {readable} readable procs",
-        opt_bytes(swap_used)
-    );
-    if denied > 0 {
-        let _ = write!(note, "; {denied} denied, run as root for all");
+    let mut note = format!("share of {} system swap", opt_bytes(swap_used));
+    if held.is_some() {
+        let _ = write!(
+            note,
+            " over the compressor's {}, {} of it in {readable} readable procs",
+            human(denominator as f64),
+            human(all_compressed as f64),
+        );
+    } else {
+        let _ = write!(note, " over {readable} readable procs");
+        if denied > 0 {
+            let _ = write!(note, "; {denied} denied, run as root for all");
+        }
     }
     section(&mut out, "swap & compressor", None);
     kv(

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "macswapi",
+  "description": "Agent skill for the macswapi CLI on macOS.",
+  "owner": {
+    "name": "Dmitry Ben",
+    "url": "https://github.com/benms"
+  },
+  "plugins": [
+    {
+      "name": "macswapi",
+      "description": "Answer macOS memory questions with macswapi: what uses memory, compressed memory or swap, who is leaking or swapping in, and who is near a jetsam kill.",
+      "category": "productivity",
+      "source": "./",
+      "homepage": "https://github.com/benms/macswapi"
+    }
+  ]
+}

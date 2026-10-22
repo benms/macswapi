@@ -159,6 +159,14 @@ pub fn pidinfo<T: Default>(pid: c_int, flavor: c_int) -> Option<T> {
     (rc == sz).then_some(info)
 }
 
+/// The process responsible for `pid`: for an XPC helper that launchd started
+/// on an app's behalf, the app, though its parent is launchd. None when the
+/// kernel has no answer (launchd itself, an exited process).
+pub fn responsible_pid(pid: c_int) -> Option<c_int> {
+    let r = unsafe { responsibility_get_pid_responsible_for_pid(pid) };
+    (r > 0).then_some(r)
+}
+
 pub fn rusage(pid: c_int) -> Option<RusageInfoV2> {
     let mut info = RusageInfoV2::default();
     let rc = unsafe { proc_pid_rusage(pid, RUSAGE_INFO_V2, &mut info as *mut _ as *mut c_void) };

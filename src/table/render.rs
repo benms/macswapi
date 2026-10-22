@@ -81,20 +81,48 @@ pub fn render_table(
     }
 }
 
-/// CSV: every column of the mode, whole numbers, empty where N/A.
-pub fn render_csv(out: &mut String, layout: &Layout, rows: &[Row], tree: bool) {
-    let mut head = vec!["pid", "ppid", "name"];
-    if tree {
+/// The CSV header line: every column of the mode but TREND; `depth` in tree
+/// and app modes, `time` first when streaming.
+pub fn csv_header(layout: &Layout, depth: bool, time: bool) -> String {
+    let mut head = Vec::new();
+    if time {
+        head.push("time");
+    }
+    head.extend(["pid", "ppid", "name"]);
+    if depth {
         head.push("depth");
     }
-    head.extend(layout.cols.iter().map(|c| c.csv_name()));
-    let _ = writeln!(out, "{}", head.join(","));
+    head.extend(
+        layout
+            .cols
+            .iter()
+            .filter(|c| c.in_csv())
+            .map(|c| c.csv_name()),
+    );
+    format!("{}\n", head.join(","))
+}
+
+/// CSV rows, whole numbers, empty where N/A; each led by `time` if given.
+pub fn render_csv_rows(
+    out: &mut String,
+    layout: &Layout,
+    rows: &[Row],
+    depth: bool,
+    time: Option<&str>,
+) {
     for r in rows {
-        let mut fields = vec![r.pid.to_string(), r.ppid.to_string(), csv_field(&r.name)];
-        if tree {
+        let mut fields = Vec::new();
+        if let Some(t) = time {
+            fields.push(t.to_string());
+        }
+        fields.extend([r.pid.to_string(), r.ppid.to_string(), csv_field(&r.name)]);
+        if depth {
             fields.push(r.depth.to_string());
         }
         for (i, &col) in layout.cols.iter().enumerate() {
+            if !col.in_csv() {
+                continue;
+            }
             let shown = !r.rollup || col.sums();
             fields.push(
                 r.vals[i]
@@ -104,6 +132,12 @@ pub fn render_csv(out: &mut String, layout: &Layout, rows: &[Row], tree: bool) {
         }
         let _ = writeln!(out, "{}", fields.join(","));
     }
+}
+
+/// CSV: the header, then the rows.
+pub fn render_csv(out: &mut String, layout: &Layout, rows: &[Row], depth: bool) {
+    out.push_str(&csv_header(layout, depth, false));
+    render_csv_rows(out, layout, rows, depth, None);
 }
 
 #[cfg(test)]
@@ -129,5 +163,21 @@ mod tests {
              7,1,\"a, \"\"b\"\"\",2048,,\n\
              8,7,p8,1024,0,0\n"
         );
+    }
+
+    #[test]
+    fn test_csv_stream_skips_trend() {
+        let layout = Layout {
+            cols: vec![Col::Foot1, Col::Spark, Col::Grew],
+            visible: vec![0, 1, 2],
+        };
+        assert_eq!(
+            csv_header(&layout, true, true),
+            "time,pid,ppid,name,depth,foot1,grew_pct\n"
+        );
+        let mut out = String::new();
+        let r = row(3, 1, &[Some(10.0), None, Some(50.0)]);
+        render_csv_rows(&mut out, &layout, &[r], false, Some("T"));
+        assert_eq!(out, "T,3,1,p3,10,50\n");
     }
 }

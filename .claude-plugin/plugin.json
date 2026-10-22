@@ -1,0 +1,13 @@
+{
+  "name": "macswapi",
+  "version": "0.1.0",
+  "description": "Answer macOS memory questions with the macswapi CLI: what uses memory, compressed memory or swap, who is leaking or swapping in, and who is near a jetsam kill.",
+  "author": {
+    "name": "Dmitry Ben",
+    "url": "https://github.com/benms"
+  },
+  "homepage": "https://github.com/benms/macswapi",
+  "repository": "https://github.com/benms/macswapi",
+  "license": "MIT",
+  "keywords": ["macos", "memory", "swap", "leak", "jetsam", "cli"]
+}

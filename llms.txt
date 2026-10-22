@@ -1,0 +1,22 @@
+# macswapi
+
+> Read-only macOS CLI that reports per-process memory: exact compressed memory and physical footprint, an estimated share of swap, exact bytes swapped in, apps rolled up with their XPC helpers, and a leak watch with alerts. Zero dependencies, written in Rust.
+
+Source: https://github.com/benms/macswapi
+
+## Install for the user
+
+If you are an agent asked to install macswapi, tell the user what each command does before you run it.
+
+1. The CLI (needs Rust to build):
+   - Homebrew: `brew tap benms/macswapi https://github.com/benms/macswapi`, then `brew install --HEAD macswapi`
+   - From a clone: `./install.sh --prefix ~/.local` (or `./install.sh` for /usr/local, which may ask for sudo)
+2. The agent skill, which teaches you to use macswapi without hanging on its interactive watch:
+   - Claude Code, Codex, Cursor and other agents: `npx skills add benms/macswapi -a claude-code codex cursor -g -y`
+   - Or the Claude Code plugin: `/plugin install macswapi --marketplace benms/macswapi`
+
+Then run `macswapi --help` to confirm, and tell the user they can ask things like "what is using my swap?" or "is something leaking?".
+
+## Use
+
+The skill is at skills/macswapi/SKILL.md. In short: `macswapi 10 -a` for apps by compressed memory, `macswapi --once 5` for who is swapping in now, never `macswapi -w` without `--csv` (it waits for a key), and never run sudo for the user.

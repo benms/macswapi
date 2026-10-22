@@ -7,7 +7,9 @@ use std::time::Instant;
 
 use crate::cli::Config;
 use crate::ffi::{ProcBsdInfo, PROC_PIDTBSDINFO};
-use crate::kernel::{list_pids, pidinfo, proc_display_name, resolve_user, task_vm, VmStats};
+use crate::kernel::{
+    list_pids, pidinfo, proc_display_name, resolve_user, responsible_pid, task_vm, VmStats,
+};
 
 pub type StartTime = (u64, u64);
 
@@ -17,6 +19,8 @@ pub struct Proc {
     pub ppid: c_int,
     pub uid: Option<u32>,
     pub start: Option<StartTime>,
+    /// the process macOS holds responsible for this one (`--app` groups by it)
+    pub resp: Option<c_int>,
     pub name: String,
     pub vm: VmStats,
 }
@@ -32,7 +36,7 @@ impl SampleSet {
         self.procs.len() + self.denied
     }
 
-    /// The SWAP~ denominator: every readable process, whatever is filtered out.
+    /// Compressed memory over every readable process, whatever is filtered out.
     pub fn total_compressed(&self) -> u64 {
         self.procs.values().map(|p| p.vm.compressed).sum()
     }
@@ -44,6 +48,14 @@ pub fn swap_ratio(swap_total: Option<u64>, total_compressed: u64) -> Option<f64>
     swap_total
         .filter(|_| total_compressed > 0)
         .map(|swap| swap as f64 / total_compressed as f64)
+}
+
+/// The SWAP~ denominator: what the compressor holds system-wide (`held`, from
+/// `host_statistics64`) when the host reports it, so kernel_task and processes
+/// we can't read keep their share instead of it landing on the readable ones.
+/// Never below the readable sum, as the two are read at different instants.
+pub fn swap_denominator(held: Option<u64>, readable: u64) -> u64 {
+    held.map_or(readable, |h| h.max(readable))
 }
 
 pub fn same_process_start(a: Option<StartTime>, b: Option<StartTime>) -> bool {
@@ -66,6 +78,7 @@ pub fn sample() -> SampleSet {
             start: info
                 .as_ref()
                 .map(|i| (i.pbi_start_tvsec, i.pbi_start_tvusec)),
+            resp: responsible_pid(pid),
             name: proc_display_name(pid),
             vm,
         };
@@ -119,6 +132,25 @@ pub fn interval_swapins(a: &SampleSet, b: &SampleSet) -> Option<u64> {
     total
 }
 
+/// Bytes each process swapped in between samples, largest first, zeros left
+/// out; over every process readable in both, as `interval_swapins`.
+pub fn swapins_by_proc<'a>(a: &SampleSet, b: &'a SampleSet) -> Vec<(&'a Proc, u64)> {
+    let mut out: Vec<(&Proc, u64)> = b
+        .procs
+        .values()
+        .filter_map(|p| {
+            let q = a.procs.get(&p.pid)?;
+            if !same_process_start(q.start, p.start) {
+                return None;
+            }
+            Some((p, p.vm.swapins?.saturating_sub(q.vm.swapins?)))
+        })
+        .filter(|&(_, n)| n > 0)
+        .collect();
+    out.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.pid.cmp(&y.0.pid)));
+    out
+}
+
 /// `--name` / `--user`: which processes become rows. Never applied to the
 /// SWAP~ denominator, which must cover every readable process.
 pub struct Filter {
@@ -169,6 +201,13 @@ mod tests {
     }
 
     #[test]
+    fn test_swap_denominator() {
+        assert_eq!(swap_denominator(None, 5), 5); // host total unavailable
+        assert_eq!(swap_denominator(Some(10), 5), 10); // the rest is unattributed
+        assert_eq!(swap_denominator(Some(3), 5), 5); // read a moment apart
+    }
+
+    #[test]
     fn test_same_process_start_fails_closed() {
         assert!(same_process_start(Some((10, 20)), Some((10, 20))));
         assert!(!same_process_start(Some((10, 20)), Some((10, 21))));
@@ -183,6 +222,7 @@ mod tests {
             ppid: 1,
             uid: Some(501),
             start: Some((start, 0)),
+            resp: None,
             name: format!("p{pid}"),
             vm: VmStats {
                 compressed: 0,
@@ -225,6 +265,11 @@ mod tests {
         assert_eq!(pids(&started), vec![3, 4]);
         assert_eq!(pids(&exited), vec![2, 3]);
         assert_eq!(interval_swapins(&a, &b), Some(30)); // only pid 1 was sampled twice
+        let by_proc: Vec<(c_int, u64)> = swapins_by_proc(&a, &b)
+            .iter()
+            .map(|(p, n)| (p.pid, *n))
+            .collect();
+        assert_eq!(by_proc, vec![(1, 30)]);
         let none = Filter {
             name: Some("nomatch".to_string()),
             uid: None,

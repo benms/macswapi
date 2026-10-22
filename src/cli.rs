@@ -2,6 +2,8 @@
 
 use std::os::raw::c_int;
 
+use crate::alert::{parse_rules, Rule};
+use crate::completions::Shell;
 use crate::table::{Col, SortBy, ONCE_COLS, SNAPSHOT_COLS, WATCH_COLS};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,36 +14,82 @@ pub enum Mode {
     /// --once: a single interval
     WatchOnce(u64),
     Detail(c_int),
+    /// --top: the dashboard, refreshed every SECS
+    Top(u64),
 }
 
 impl Mode {
     pub fn cols(self) -> &'static [(Col, bool)] {
         match self {
             Mode::Snapshot | Mode::Detail(_) => SNAPSHOT_COLS,
-            Mode::Watch(_) => WATCH_COLS,
+            Mode::Watch(_) | Mode::Top(_) => WATCH_COLS,
             Mode::WatchOnce(_) => ONCE_COLS,
         }
     }
 }
 
+/// How rows nest: not at all, by parent (`--tree`) or by responsible app
+/// (`--app`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    Flat,
+    Tree,
+    App,
+}
+
 #[derive(Debug, PartialEq)]
 pub struct Config {
     pub topn: usize,
+    /// whether N was given (`--top` sizes its cards to the window otherwise)
+    pub topn_given: bool,
     pub show_parent: bool,
     pub extended: bool,
-    pub tree: bool,
+    pub group: Group,
     pub csv: bool,
     pub sort: Option<SortBy>,
     pub name: Option<String>,
     pub user: Option<String>,
     pub mode: Mode,
     pub help: bool,
+    /// `--completions SHELL`: print that script and exit
+    pub completions: Option<Shell>,
+    /// watch: `--alert` rules, and how long one must hold (`--for`)
+    pub alerts: Vec<Rule>,
+    pub alert_for: u64,
+    pub exit_on_alert: bool,
+    pub notify: bool,
+    /// watch: append every interval's rows as CSV to this file
+    pub record: Option<String>,
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            topn: 20,
+            topn_given: false,
+            show_parent: false,
+            extended: false,
+            group: Group::Flat,
+            csv: false,
+            sort: None,
+            name: None,
+            user: None,
+            mode: Mode::Snapshot,
+            help: false,
+            completions: None,
+            alerts: Vec::new(),
+            alert_for: 0,
+            exit_on_alert: false,
+            notify: false,
+            record: None,
+        }
+    }
 }
 
 impl Config {
     pub fn sort_by(&self) -> SortBy {
         self.sort.unwrap_or(match self.mode {
-            Mode::Watch(_) | Mode::WatchOnce(_) => SortBy::Col(Col::Delta),
+            Mode::Watch(_) | Mode::WatchOnce(_) | Mode::Top(_) => SortBy::Col(Col::Delta),
             Mode::Snapshot | Mode::Detail(_) => SortBy::Col(Col::Cmprs),
         })
     }
@@ -73,7 +121,7 @@ fn parse_sort(key: &str, mode: Mode) -> Result<SortBy, String> {
         .ok_or_else(|| format!("unknown sort key: {key} (see --help)"))?;
     let col = match mode {
         Mode::Snapshot | Mode::Detail(_) => snapshot,
-        Mode::Watch(_) | Mode::WatchOnce(_) => interval,
+        Mode::Watch(_) | Mode::WatchOnce(_) | Mode::Top(_) => interval,
     };
     col.filter(|c| mode.cols().iter().any(|(m, _)| m == c))
         .map(SortBy::Col)
@@ -81,24 +129,41 @@ fn parse_sort(key: &str, mode: Mode) -> Result<SortBy, String> {
 }
 
 pub const USAGE: &str = "\
-macswapi [N] [options] [-w|--watch [SECS] | --once [SECS] | --pid PID]
-  N              top N rows (default 20, 0=all); with --tree, top N trees
+macswapi [N] [options] [-w|--watch [SECS] | --once [SECS] | -T|--top [SECS] | --pid PID]
+  N              top N rows (default 20, 0=all); with --tree/--app, top N groups;
+                 with --top, rows in the apps card
   -p --parent    add PPID + parent-name columns
   -x --extended  add FOOT_PK, CMPRS_PK, DECOMP, HEADROOM
                  (watch: DECOMP, HEADROOM, and JETSAM_IN unless --once)
   -t --tree      process trees; each row rolled up over its subtree
+  -a --app       group under the responsible app, XPC helpers included;
+                 each app rolled up over its processes
      --sort KEY  cmprs swap foot swapins peak cpeak decomp headroom pid name
                  (watch: delta foot swapins decomp headroom grew pid name,
                  grew not with --once; default cmprs, watch delta)
      --name STR  only processes whose name contains STR (any case)
      --user USER only processes of USER (login name or uid)
      --csv       every column of the mode as CSV, raw numbers
-                 (watch: a single interval, as with --once)
-  -w --watch     leak watch: refresh every SECS (default 2s), GREW% flags
-                 sustained growth; space pauses, q quits
+                 (watch: streamed, a time column first)
+  -w --watch     leak watch: refresh every SECS (default 2s), GREW% and
+                 TREND show sustained growth; space pauses, q quits
                  (-l --live and --delta are aliases)
      --once      watch a single interval (default 2s), print it and exit
+  -T --top       one-screen dashboard: memory, compressor, swap and pressure
+                 cards, apps and growing processes; refreshed every SECS
+                 (default 2s); space pauses, a: apps/processes, ? or h:
+                 help, q quits
      --pid PID   everything macswapi can read about one process
+     --completions SHELL  print a zsh, bash or fish completion script
+  watch and top only:
+     --alert RULES  fire when a rule holds for any process, e.g.
+                 'foot>2G,headroom<200M,grew>=100,swapins>1M/s,rate>5M/s'
+                 or 'pressure>=warn'; quote it for the shell
+     --for SECS  a rule must hold this long to fire (default 0)
+     --exit-on-alert  exit with status 3 at the first firing
+     --notify    a Notification Center banner for new firings
+     --record FILE  append every interval's rows (all of them) as CSV
+                 (watch only)
   -h --help      this help
   SECS must be positive and immediately follow its flag; N must appear
   before the interval flag. example: macswapi 50 --watch 5
@@ -108,19 +173,10 @@ macswapi [N] [options] [-w|--watch [SECS] | --once [SECS] | --pid PID]
 const WATCH_SECS: u64 = 2;
 
 pub fn parse_args(args: &[String]) -> Result<Config, String> {
-    let mut config = Config {
-        topn: 20,
-        show_parent: false,
-        extended: false,
-        tree: false,
-        csv: false,
-        sort: None,
-        name: None,
-        user: None,
-        mode: Mode::Snapshot,
-        help: false,
-    };
-    let (mut watch, mut once) = (false, false);
+    let mut config = Config::default();
+    let (mut watch, mut once, mut top) = (false, false, false);
+    let (mut tree, mut app) = (false, false);
+    let mut alert_for: Option<u64> = None;
     let mut interval: Option<u64> = None;
     let mut pid: Option<c_int> = None;
     let mut sort: Option<String> = None;
@@ -133,11 +189,21 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
                 config.help = true;
                 return Ok(config);
             }
+            "--completions" => {
+                let shell = args
+                    .get(i + 1)
+                    .ok_or("--completions needs zsh, bash or fish")?;
+                config.completions = Some(Shell::parse(shell)?);
+                return Ok(config);
+            }
             "-p" | "--parent" => config.show_parent = true,
             "-x" | "--extended" => config.extended = true,
-            "-t" | "--tree" => config.tree = true,
+            "-t" | "--tree" => tree = true,
+            "-a" | "--app" => app = true,
             "--csv" => config.csv = true,
-            "--sort" | "--name" | "--user" | "--pid" => {
+            "--exit-on-alert" => config.exit_on_alert = true,
+            "--notify" => config.notify = true,
+            "--sort" | "--name" | "--user" | "--pid" | "--alert" | "--for" | "--record" => {
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| format!("{arg} needs a value"))?
@@ -147,6 +213,15 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
                     "--sort" => sort = Some(value),
                     "--name" => config.name = Some(value),
                     "--user" => config.user = Some(value),
+                    "--alert" => config.alerts.extend(parse_rules(&value)?),
+                    "--for" => {
+                        alert_for = Some(
+                            value
+                                .parse::<u64>()
+                                .map_err(|_| format!("--for needs whole seconds, got {value}"))?,
+                        );
+                    }
+                    "--record" => config.record = Some(value),
                     _ => {
                         let p = value.parse::<c_int>().ok().filter(|&p| p > 0);
                         pid =
@@ -156,11 +231,11 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
                     }
                 }
             }
-            "-w" | "--watch" | "--delta" | "-l" | "--live" | "--once" => {
-                let seen = if arg == "--once" {
-                    &mut once
-                } else {
-                    &mut watch
+            "-w" | "--watch" | "--delta" | "-l" | "--live" | "--once" | "-T" | "--top" => {
+                let seen = match arg.as_str() {
+                    "--once" => &mut once,
+                    "-T" | "--top" => &mut top,
+                    _ => &mut watch,
                 };
                 if *seen {
                     return Err(format!(
@@ -181,10 +256,11 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
             }
             other => {
                 if let Ok(topn) = other.parse::<usize>() {
-                    if watch || once {
+                    if watch || once || top {
                         return Err("N must appear before the interval flag".to_string());
                     }
                     config.topn = topn;
+                    config.topn_given = true;
                 } else {
                     return Err(format!("unknown arg: {other}"));
                 }
@@ -193,26 +269,60 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
         i += 1;
     }
 
+    config.group = match (tree, app) {
+        (true, true) => return Err("--tree and --app are two ways to group: pick one".to_string()),
+        (true, false) => Group::Tree,
+        (false, true) => Group::App,
+        (false, false) => Group::Flat,
+    };
     let secs = interval.unwrap_or(WATCH_SECS);
+    if top && (watch || once || pid.is_some()) {
+        return Err("--top is its own mode: no --watch, --once or --pid".to_string());
+    }
     config.mode = match (pid, watch || once) {
         (Some(_), true) => return Err("--pid can't be combined with --watch/--once".to_string()),
         (Some(p), false) => Mode::Detail(p),
-        // CSV is a single table, so it takes a single interval.
-        (None, true) if once || config.csv => Mode::WatchOnce(secs),
+        (None, true) if once => Mode::WatchOnce(secs),
         (None, true) => Mode::Watch(secs),
+        (None, false) if top => Mode::Top(secs),
         (None, false) => Mode::Snapshot,
     };
+    if top
+        && (config.show_parent
+            || config.extended
+            || config.group != Group::Flat
+            || config.csv
+            || sort.is_some()
+            || config.record.is_some())
+    {
+        return Err(
+            "--top draws its own cards: no -p, -x, --tree, --app, --csv, --sort or --record \
+             (press a in it to switch apps/processes)"
+                .to_string(),
+        );
+    }
     if matches!(config.mode, Mode::Detail(_))
-        && (config.tree
+        && (config.group != Group::Flat
             || config.csv
             || sort.is_some()
             || config.name.is_some()
             || config.user.is_some())
     {
         return Err(
-            "--pid shows one process: no --tree, --csv, --sort, --name or --user".to_string(),
+            "--pid shows one process: no --tree, --app, --csv, --sort, --name or --user"
+                .to_string(),
         );
     }
+    if !config.alerts.is_empty() && !matches!(config.mode, Mode::Watch(_) | Mode::Top(_)) {
+        return Err("--alert needs --watch or --top (not --once)".to_string());
+    }
+    if config.record.is_some() && !matches!(config.mode, Mode::Watch(_)) {
+        return Err("--record needs --watch (not --once)".to_string());
+    }
+    if config.alerts.is_empty() && (alert_for.is_some() || config.exit_on_alert || config.notify) {
+        return Err("--for, --exit-on-alert and --notify need --alert".to_string());
+    }
+    config.alert_for = alert_for.unwrap_or(0);
     config.sort = sort.map(|key| parse_sort(&key, config.mode)).transpose()?;
     Ok(config)
 }
@@ -233,17 +343,47 @@ mod tests {
             parse(&["20", "--delta", "5"]).unwrap(),
             Config {
                 topn: 20,
-                show_parent: false,
-                extended: false,
-                tree: false,
-                csv: false,
-                sort: None,
-                name: None,
-                user: None,
+                topn_given: true,
                 mode: Mode::Watch(5),
-                help: false,
+                ..Config::default()
             }
         );
+    }
+
+    #[test]
+    fn test_parse_args_top() {
+        assert_eq!(parse(&["-T"]).unwrap().mode, Mode::Top(2));
+        assert_eq!(parse(&["--top", "5"]).unwrap().mode, Mode::Top(5));
+        let c = parse(&["8", "-T", "--name", "chrome", "--alert", "foot>1G"]).unwrap();
+        assert_eq!((c.topn, c.topn_given, c.mode), (8, true, Mode::Top(2)));
+        assert!(!parse(&["-T"]).unwrap().topn_given);
+        assert!(parse(&["-t"]).unwrap().mode == Mode::Snapshot); // -t stays --tree
+        for bad in [
+            &["-T", "-w"][..],
+            &["-T", "--once"],
+            &["-T", "--pid", "1"],
+            &["-T", "-t"],
+            &["-T", "-a"],
+            &["-T", "--csv"],
+            &["-T", "--sort", "foot"],
+            &["-T", "-x"],
+            &["-T", "-p"],
+            &["-T", "--record", "x.csv"],
+            &["-T", "0"],
+            &["-T", "-T"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_args_completions() {
+        assert_eq!(
+            parse(&["--completions", "fish"]).unwrap().completions,
+            Some(Shell::Fish)
+        );
+        assert!(parse(&["--completions"]).is_err());
+        assert!(parse(&["--completions", "tcsh"]).is_err());
     }
 
     #[test]
@@ -280,7 +420,11 @@ mod tests {
             parse(&["--once", "-w", "5"]).unwrap().mode,
             Mode::WatchOnce(5)
         );
-        assert_eq!(parse(&["--csv", "-w"]).unwrap().mode, Mode::WatchOnce(2));
+        assert_eq!(parse(&["--csv", "-w"]).unwrap().mode, Mode::Watch(2)); // streams
+        assert_eq!(
+            parse(&["--csv", "--once"]).unwrap().mode,
+            Mode::WatchOnce(2)
+        );
         assert_eq!(parse(&["--once", "5"]).unwrap().mode, Mode::WatchOnce(5));
         assert_eq!(parse(&["--csv"]).unwrap().mode, Mode::Snapshot);
         assert!(parse(&["-w", "3", "--once", "5"]).is_err());
@@ -300,7 +444,10 @@ mod tests {
             "-t", "--csv", "--sort", "swapins", "--name", "Chrome", "--user", "501",
         ])
         .unwrap();
-        assert!(c.tree && c.csv);
+        assert!(c.group == Group::Tree && c.csv);
+        assert_eq!(parse(&["-a"]).unwrap().group, Group::App);
+        assert_eq!(parse(&["--app", "-w"]).unwrap().group, Group::App);
+        assert!(parse(&["-a", "-t"]).is_err());
         assert_eq!(c.sort, Some(SortBy::Col(Col::Swapins)));
         assert_eq!(c.name.as_deref(), Some("Chrome"));
         assert_eq!(c.user.as_deref(), Some("501"));
@@ -311,10 +458,42 @@ mod tests {
     fn test_parse_args_rejects_conflicts() {
         assert!(parse(&["--pid", "1", "--watch"]).is_err());
         assert!(parse(&["--pid", "1", "--tree"]).is_err());
+        assert!(parse(&["--pid", "1", "--app"]).is_err());
         assert!(parse(&["--pid", "1", "--name", "x"]).is_err());
         assert!(parse(&["--pid", "1", "--once"]).is_err());
         assert!(parse(&["--sort", "delta"]).is_err()); // watch only
         assert!(parse(&["--sort", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn test_parse_args_alerts_and_record() {
+        let c = parse(&[
+            "-w",
+            "--alert",
+            "foot>2G",
+            "--alert",
+            "grew>=100,pressure>=warn",
+            "--for",
+            "30",
+            "--exit-on-alert",
+            "--notify",
+            "--record",
+            "/tmp/x.csv",
+        ])
+        .unwrap();
+        assert_eq!(c.alerts.len(), 3);
+        assert_eq!(c.alert_for, 30);
+        assert!(c.exit_on_alert && c.notify);
+        assert_eq!(c.record.as_deref(), Some("/tmp/x.csv"));
+        assert!(parse(&["--alert", "foot>2G"]).is_err()); // snapshot
+        assert!(parse(&["-T", "--alert", "foot>2G", "--exit-on-alert"]).is_ok());
+        assert!(parse(&["--once", "--alert", "foot>2G"]).is_err());
+        assert!(parse(&["--record", "x.csv"]).is_err());
+        assert!(parse(&["-w", "--for", "5"]).is_err()); // no rule
+        assert!(parse(&["-w", "--notify"]).is_err());
+        assert!(parse(&["-w", "--alert", "foot>2G", "--for", "-1"]).is_err());
+        assert!(parse(&["-w", "--alert", "bogus"]).is_err());
+        assert!(parse(&["--pid", "3", "--alert", "foot>1G"]).is_err());
     }
 
     #[test]

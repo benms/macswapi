@@ -52,6 +52,9 @@ extern "C" {
     pub fn proc_name(pid: c_int, buf: *mut c_void, sz: u32) -> c_int;
     pub fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buf: *mut c_void, sz: c_int) -> c_int;
     pub fn proc_pid_rusage(pid: c_int, flavor: c_int, buf: *mut c_void) -> c_int;
+    /// Private (libquarantine, re-exported by libSystem): the process macOS
+    /// holds responsible for `pid`, as Activity Monitor groups them; -1 if none.
+    pub fn responsibility_get_pid_responsible_for_pid(pid: c_int) -> c_int;
     pub fn sysctlbyname(
         name: *const c_char,
         oldp: *mut c_void,

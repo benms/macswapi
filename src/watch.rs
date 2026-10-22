@@ -1,24 +1,35 @@
-//! Watch modes: footprint change over a single interval (`--once`, `--csv`),
-//! or refreshed every interval with the growth trend (`--watch`).
+//! Watch modes: footprint change over a single interval (`--once`), or
+//! refreshed every interval with the growth trend (`--watch`), drawn on the
+//! terminal or streamed as CSV, with `--alert` rules and `--record`.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::cli::Config;
+use crate::alert::{notify, Alerts, Firing};
+use crate::cli::{Config, Group};
 use crate::ffi::{isatty, signal, SIGHUP, SIGINT, SIGTERM};
-use crate::format::opt_bytes;
+use crate::format::{iso8601_utc, opt_bytes};
+use crate::kernel::proc_display_name;
+use crate::record::Recorder;
 use crate::sample::{
-    churn, interval_swapins, same_process_start, sample, Filter, SampleSet, StartTime,
+    churn, interval_swapins, same_process_start, sample, swapins_by_proc, Filter, SampleSet,
+    StartTime,
 };
 use crate::summary::{summary, SysMem};
-use crate::table::{arrange, render_csv, render_table, Layout, ParentNames, Row, RowSrc, Trend};
+use crate::table::{
+    arrange, csv_header, cut, render_csv, render_csv_rows, render_table, Layout, ParentNames, Row,
+    RowSrc, Trend,
+};
 use crate::term::{color_enabled, emit_raw, term_rows, wait_key, Screen};
 
+/// Exit status of `--exit-on-alert` when a rule fires.
+pub(crate) const ALERT_EXIT: i32 = 3;
+
 /// Rows for processes present in both samples with the same start time.
-fn interval_rows(
+pub(crate) fn interval_rows(
     layout: &Layout,
     filter: &Filter,
     a: &SampleSet,
@@ -34,18 +45,69 @@ fn interval_rows(
                 .procs
                 .get(&p.pid)
                 .filter(|q| same_process_start(q.start, p.start))?;
-            let trend = hist
-                .and_then(|h| h.get(&(p.pid, p.start?)))
-                .map(|h| trend(h, p.vm.limit_remaining));
-            Some(layout.row(&RowSrc {
+            let points = hist.and_then(|h| h.get(&(p.pid, p.start?)));
+            let mut row = layout.row(&RowSrc {
                 now: p,
                 before: Some(q),
                 elapsed,
                 swap_per_cmprs: None,
-                trend,
-            }))
+                trend: points.map(|h| trend(h, p.vm.limit_remaining)),
+            });
+            if let Some(h) = points {
+                row.hist = h.iter().map(|&(_, foot)| foot).collect();
+            }
+            Some(row)
         })
         .collect()
+}
+
+/// Bytes swapped in between samples, over every process sampled twice, and
+/// the `top` processes (with `by_app`, apps) they went to, as "Xcode 812 74%".
+pub(crate) fn swapin_culprits(
+    a: &SampleSet,
+    b: &SampleSet,
+    by_app: bool,
+    top: usize,
+) -> (Option<u64>, Vec<String>) {
+    let total = interval_swapins(a, b);
+    let Some(sum) = total.filter(|&t| t > 0) else {
+        return (total, Vec::new());
+    };
+    let mut by: Vec<(c_int, u64)> = Vec::new();
+    for (p, n) in swapins_by_proc(a, b) {
+        let key = if by_app {
+            p.resp.unwrap_or(p.pid)
+        } else {
+            p.pid
+        };
+        match by.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, acc)) => *acc += n,
+            None => by.push((key, n)),
+        }
+    }
+    by.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
+    let names = by
+        .iter()
+        .take(top)
+        .map(|&(pid, n)| {
+            let name = b
+                .procs
+                .get(&pid)
+                .map_or_else(|| proc_display_name(pid), |p| p.name.clone());
+            format!("{name} {pid} {:.0}%", 100.0 * n as f64 / sum as f64)
+        })
+        .collect();
+    (total, names)
+}
+
+/// "swapped in during interval: 120.00M — Xcode 812 74%, Slack 1044 10%".
+fn swapin_line(out: &mut String, label: &str, a: &SampleSet, b: &SampleSet, by_app: bool) {
+    let (total, names) = swapin_culprits(a, b, by_app, 3);
+    let _ = write!(out, "{label}: {}", opt_bytes(total));
+    if !names.is_empty() {
+        let _ = write!(out, " — {}", names.join(", "));
+    }
+    out.push('\n');
 }
 
 /// "started (2): foo 123, bar 456" and the like, at most 8 names each.
@@ -88,15 +150,18 @@ pub fn run_once(config: &Config, filter: &Filter, interval: u64) {
     let sys1 = SysMem::read();
 
     let layout = Layout::new(config);
-    let (rows, _) = arrange(
-        interval_rows(&layout, filter, &a, &b, None),
-        &layout,
-        config,
+    let rows = cut(
+        arrange(
+            interval_rows(&layout, filter, &a, &b, None),
+            &layout,
+            config,
+        ),
+        config.topn,
     );
 
     let mut out = String::new();
     if config.csv {
-        render_csv(&mut out, &layout, &rows, config.tree);
+        render_csv(&mut out, &layout, &rows, config.group != Group::Flat);
         print!("{out}");
         return;
     }
@@ -118,10 +183,12 @@ pub fn run_once(config: &Config, filter: &Filter, interval: u64) {
         "interval {:.1}s — one interval = allocation churn; trust SUSTAINED growth as leak signal (watch without --once tracks it).",
         elapsed
     );
-    let _ = writeln!(
-        out,
-        "swapped in during interval (all procs sampled twice): {}",
-        opt_bytes(interval_swapins(&a, &b))
+    swapin_line(
+        &mut out,
+        "swapped in during interval (all procs sampled twice)",
+        &a,
+        &b,
+        config.group == Group::App,
     );
     churn_lines(&mut out, &a, &b, filter, color);
     let _ = writeln!(
@@ -138,15 +205,15 @@ pub fn run_once(config: &Config, filter: &Filter, interval: u64) {
 }
 
 /// Watch-mode footprint history window, in intervals.
-const TREND_WINDOW: usize = 10;
+pub(crate) const TREND_WINDOW: usize = 10;
 /// Intervals needed before GREW% and JETSAM_IN are shown.
 const TREND_MIN: usize = 3;
 
 /// (seconds since start, footprint) per process, oldest first, keyed by PID
 /// and start time so a reused PID starts a fresh history.
-type History = HashMap<(c_int, StartTime), VecDeque<(f64, u64)>>;
+pub(crate) type History = HashMap<(c_int, StartTime), VecDeque<(f64, u64)>>;
 
-fn record(hist: &mut History, s: &SampleSet, t: f64) {
+pub(crate) fn record(hist: &mut History, s: &SampleSet, t: f64) {
     hist.retain(|(pid, start), _| s.procs.get(pid).is_some_and(|p| p.start == Some(*start)));
     for p in s.procs.values() {
         if let Some(start) = p.start {
@@ -188,25 +255,65 @@ extern "C" fn request_stop(_sig: c_int) {
     STOP.store(true, Ordering::SeqCst);
 }
 
-/// Draws a frame: in place (clipped to the window) on a terminal, else appended.
-fn show(status: &str, frame: &str, tty: bool) {
+/// Ctrl-C, SIGTERM and SIGHUP end the loop cleanly, so the terminal is restored.
+pub(crate) fn catch_stop_signals() {
+    for sig in [SIGHUP, SIGINT, SIGTERM] {
+        unsafe { signal(sig, request_stop as extern "C" fn(c_int) as usize) };
+    }
+}
+
+/// What ended a wait.
+pub(crate) enum Wake {
+    /// the interval is over
+    Tick,
+    /// q, or a stop signal
+    Quit,
+    /// any other key
+    Key(u8),
+}
+
+/// Waits until `deadline` (for ever while `paused`), watching for keys when
+/// `keys` and for stop signals.
+pub(crate) fn wait_until(deadline: Instant, paused: bool, keys: bool) -> Wake {
+    while paused || Instant::now() < deadline {
+        if STOP.load(Ordering::SeqCst) {
+            return Wake::Quit;
+        }
+        let key = if keys {
+            wait_key(100)
+        } else {
+            std::thread::sleep(Duration::from_millis(100));
+            None
+        };
+        match key {
+            Some(b'q' | b'Q') => return Wake::Quit,
+            Some(k) => return Wake::Key(k),
+            None => {}
+        }
+    }
+    Wake::Tick
+}
+
+/// Draws text: in place (clipped to the window) on a terminal, else appended.
+pub(crate) fn draw(text: &str, tty: bool) {
     let mut s = String::new();
     if tty {
         let height = term_rows().unwrap_or(usize::MAX);
         s.push_str("\x1b[H");
-        for line in status
-            .lines()
-            .chain(frame.lines())
-            .take(height.saturating_sub(1))
-        {
+        for line in text.lines().take(height.saturating_sub(1)) {
             s.push_str(line);
             s.push_str("\x1b[K\n");
         }
         s.push_str("\x1b[J");
     } else {
-        let _ = write!(s, "{status}\n{frame}\n");
+        let _ = writeln!(s, "{text}");
     }
     emit_raw(&s);
+}
+
+/// Draws a frame under its status line.
+fn show(status: &str, frame: &str, tty: bool) {
+    draw(&format!("{status}\n{frame}"), tty);
 }
 
 fn status_line(interval: u64, tick: u64, paused: bool, keys: bool) -> String {
@@ -219,39 +326,46 @@ fn status_line(interval: u64, tick: u64, paused: bool, keys: bool) -> String {
     format!("macswapi {state} · every {interval}s · refresh #{tick} · {help}")
 }
 
+/// What watch_frame draws besides the samples.
+struct FrameExtras<'a> {
+    rows: &'a [Row],
+    alerts: &'a Alerts,
+    firing: &'a [Firing],
+    color: bool,
+}
+
 fn watch_frame(
     config: &Config,
+    layout: &Layout,
     filter: &Filter,
     sys: (&SysMem, &SysMem),
     a: &SampleSet,
     b: &SampleSet,
-    hist: &History,
+    x: &FrameExtras,
 ) -> String {
-    let color = color_enabled();
-    let layout = Layout::new(config);
-    let (rows, _) = arrange(
-        interval_rows(&layout, filter, a, b, Some(hist)),
-        &layout,
-        config,
-    );
     let mut out = String::new();
     summary(&mut out, sys.1, Some(sys.0));
     out.push('\n');
     render_table(
         &mut out,
-        &layout,
-        &rows,
+        layout,
+        x.rows,
         &mut ParentNames::new(b),
         config.show_parent,
-        color,
+        x.color,
     );
     let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "swapped in during interval: {}",
-        opt_bytes(interval_swapins(a, b))
+    if x.alerts.active() {
+        alert_lines(&mut out, config, x.alerts, x.firing, x.color);
+    }
+    swapin_line(
+        &mut out,
+        "swapped in during interval",
+        a,
+        b,
+        config.group == Group::App,
     );
-    churn_lines(&mut out, a, b, filter, color);
+    churn_lines(&mut out, a, b, filter, x.color);
     let _ = writeln!(
         out,
         "GREW%: intervals with FOOTPRINT growth, of the last {TREND_WINDOW} (shown after {TREND_MIN}); 100% = sustained"
@@ -259,15 +373,75 @@ fn watch_frame(
     out
 }
 
-pub fn run_watch(config: &Config, filter: &Filter, interval: u64) {
-    for sig in [SIGHUP, SIGINT, SIGTERM] {
-        unsafe { signal(sig, request_stop as extern "C" fn(c_int) as usize) };
+/// The firing rules, at most 8, in red on a color terminal.
+fn alert_lines(out: &mut String, config: &Config, alerts: &Alerts, firing: &[Firing], color: bool) {
+    const MAX: usize = 8;
+    let hold = if config.alert_for > 0 {
+        format!(", held {}s", config.alert_for)
+    } else {
+        String::new()
+    };
+    if firing.is_empty() {
+        let _ = writeln!(out, "alerts: none firing{hold}");
+        return;
     }
-    let tty = unsafe { isatty(1) } == 1;
+    let mut lines = vec![format!("ALERTS ({}){hold}:", firing.len())];
+    for f in firing.iter().take(MAX) {
+        let mark = if f.new { "new " } else { "" };
+        lines.push(format!("  {mark}{}", alerts.describe(f)));
+    }
+    if firing.len() > MAX {
+        lines.push(format!("  … +{} more", firing.len() - MAX));
+    }
+    for line in lines {
+        if color {
+            let _ = writeln!(out, "\x1b[31m{line}\x1b[0m");
+        } else {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+}
+
+/// One banner for this interval's new firings.
+pub(crate) fn notify_new(alerts: &Alerts, firing: &[Firing]) {
+    let new: Vec<String> = firing
+        .iter()
+        .filter(|f| f.new)
+        .map(|f| alerts.describe(f))
+        .collect();
+    match new.len() {
+        0 => {}
+        1 => notify(&new[0]),
+        n => notify(&format!("{n} alerts: {}", new.join("; "))),
+    }
+}
+
+pub(crate) fn now_utc() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    iso8601_utc(secs)
+}
+
+pub fn run_watch(config: &Config, filter: &Filter, interval: u64) {
+    catch_stop_signals();
+    let layout = Layout::new(config);
+    let depth = config.group != Group::Flat;
+    let mut recorder = config.record.as_deref().map(|path| {
+        Recorder::open(path, &csv_header(&layout, depth, true)).unwrap_or_else(|err| {
+            eprintln!("{err}");
+            std::process::exit(2);
+        })
+    });
+    let mut alerts = Alerts::new(&config.alerts, config.alert_for);
+
+    // CSV streams to stdout as it is, terminal or not.
+    let tty = !config.csv && unsafe { isatty(1) } == 1;
     // Raw keys only when output is a terminal too: if a pipe closed under us,
     // SIGPIPE would kill the process with the terminal still raw.
     let keys = tty && unsafe { isatty(0) } == 1;
     let screen = tty.then(|| Screen::enter(keys));
+    let color = !config.csv && color_enabled();
 
     let t0 = Instant::now();
     let mut sys = SysMem::read();
@@ -277,43 +451,97 @@ pub fn run_watch(config: &Config, filter: &Filter, interval: u64) {
     let mut frame = format!("waiting {interval}s for the first interval…\n");
     let mut paused = false;
     let mut tick = 0u64;
-    show(&status_line(interval, tick, paused, keys), &frame, tty);
+    if config.csv {
+        emit_raw(&csv_header(&layout, depth, true));
+    } else {
+        show(&status_line(interval, tick, paused, keys), &frame, tty);
+    }
+    let mut status = 0;
 
     'run: loop {
         let deadline = Instant::now() + Duration::from_secs(interval);
-        while paused || Instant::now() < deadline {
-            if STOP.load(Ordering::SeqCst) {
-                break 'run;
-            }
-            let key = if keys {
-                wait_key(100)
-            } else {
-                std::thread::sleep(Duration::from_millis(100));
-                None
-            };
-            match key {
-                Some(b'q' | b'Q') => break 'run,
-                Some(b' ') => {
+        loop {
+            match wait_until(deadline, paused, keys) {
+                Wake::Tick => break,
+                Wake::Quit => break 'run,
+                Wake::Key(b' ') => {
                     paused = !paused;
                     show(&status_line(interval, tick, paused, keys), &frame, tty);
                 }
-                _ => {}
+                Wake::Key(_) => {}
             }
         }
         let sys_now = SysMem::read();
         let cur = sample();
         tick += 1;
-        record(&mut hist, &cur, t0.elapsed().as_secs_f64());
-        frame = watch_frame(config, filter, (&sys, &sys_now), &prev, &cur, &hist);
-        show(&status_line(interval, tick, paused, keys), &frame, tty);
+        let t = t0.elapsed().as_secs_f64();
+        record(&mut hist, &cur, t);
+
+        // Every row: alerts and --record cover all of them, the screen the top N.
+        let rows = arrange(
+            interval_rows(&layout, filter, &prev, &cur, Some(&hist)),
+            &layout,
+            config,
+        );
+        let elapsed = cur.at.duration_since(prev.at).as_secs_f64();
+        let firing = alerts.update(t, elapsed, &layout, &rows, sys_now.pressure());
+        let stamp = now_utc();
+        if let Some(rec) = recorder.as_mut() {
+            let mut out = String::new();
+            render_csv_rows(&mut out, &layout, &rows, depth, Some(&stamp));
+            if let Err(err) = rec.write(&out) {
+                eprintln!("{err}; recording stopped");
+                recorder = None;
+            }
+        }
+        let rows = cut(rows, config.topn);
+
+        if config.csv {
+            let mut out = String::new();
+            render_csv_rows(&mut out, &layout, &rows, depth, Some(&stamp));
+            emit_raw(&out);
+            for f in firing.iter().filter(|f| f.new) {
+                eprintln!("macswapi {stamp} ALERT {}", alerts.describe(f));
+            }
+        } else {
+            let extras = FrameExtras {
+                rows: &rows,
+                alerts: &alerts,
+                firing: &firing,
+                color,
+            };
+            frame = watch_frame(
+                config,
+                &layout,
+                filter,
+                (&sys, &sys_now),
+                &prev,
+                &cur,
+                &extras,
+            );
+            if tty && firing.iter().any(|f| f.new) {
+                emit_raw("\x07");
+            }
+            show(&status_line(interval, tick, paused, keys), &frame, tty);
+        }
+        if config.notify {
+            notify_new(&alerts, &firing);
+        }
         sys = sys_now;
         prev = cur;
+        if config.exit_on_alert && !firing.is_empty() {
+            status = ALERT_EXIT;
+            break 'run;
+        }
     }
 
     if tty {
         drop(screen);
         // Leave the last frame on the normal screen.
-        print!("{frame}");
+        emit_raw(&frame);
+    }
+    if status != 0 {
+        std::process::exit(status);
     }
 }
 

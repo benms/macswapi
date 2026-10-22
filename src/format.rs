@@ -46,6 +46,46 @@ pub fn duration_str(secs: f64) -> String {
     }
 }
 
+/// Footprint history as block characters, scaled to its own range. A spread
+/// under 5% of the peak (or 1M) draws low, so allocator noise doesn't pass
+/// for a trend. Blank below two points.
+pub fn sparkline(points: &[u64]) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let (Some(&lo), Some(&hi)) = (points.iter().min(), points.iter().max()) else {
+        return String::new();
+    };
+    if points.len() < 2 {
+        return String::new();
+    }
+    let scale = (hi - lo).max(hi / 20).max(1 << 20) as f64;
+    points
+        .iter()
+        .map(|&p| BARS[((((p - lo) as f64 / scale) * 7.0).round() as usize).min(7)])
+        .collect()
+}
+
+/// Seconds since the epoch as ISO 8601 UTC: 2026-10-22T08:15:02Z.
+pub fn iso8601_utc(secs: u64) -> String {
+    // Days to civil date: Howard Hinnant's algorithm, for days >= 0.
+    let days = secs / 86_400;
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    let t = secs % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        t / 3600,
+        t % 3600 / 60,
+        t % 60
+    )
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         String::new()
@@ -116,6 +156,24 @@ mod tests {
         assert_eq!(human_signed(0.0), "+0B");
         assert_eq!(human_signed(1024.0), "+1.00K");
         assert_eq!(human_signed(-1048576.0), "-1.00M");
+    }
+
+    #[test]
+    fn test_sparkline() {
+        assert_eq!(sparkline(&[]), "");
+        assert_eq!(sparkline(&[5 << 20]), "");
+        assert_eq!(sparkline(&[100 << 20; 4]), "▁▁▁▁"); // flat
+        assert_eq!(sparkline(&[0, 1 << 20, 2 << 20, 4 << 20]), "▁▃▅█");
+        // 100K of noise on 500M stays near the floor
+        let noise = [500 << 20, (500 << 20) + 100_000, 500 << 20];
+        assert_eq!(sparkline(&noise), "▁▁▁");
+    }
+
+    #[test]
+    fn test_iso8601_utc() {
+        assert_eq!(iso8601_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso8601_utc(951_782_400), "2000-02-29T00:00:00Z"); // leap day
+        assert_eq!(iso8601_utc(1_792_646_102), "2026-10-22T05:15:02Z");
     }
 
     #[test]

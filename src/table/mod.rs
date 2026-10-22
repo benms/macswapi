@@ -1,24 +1,25 @@
 //! The process table: its columns, rows computed from samples, sort order and
-//! the cut to the top N. Tree mode nests rows in `tree`; `render` prints them.
+//! the cut to the top N. Tree and app modes nest rows in `tree`; `render`
+//! prints them.
 
 mod render;
 mod tree;
 
-pub use render::{render_csv, render_table, ParentNames};
+pub use render::{csv_header, render_csv, render_csv_rows, render_table, ParentNames};
 
 use std::cmp::Ordering;
 use std::os::raw::c_int;
 
-use crate::cli::Config;
-use crate::format::{duration_str, headroom_str, human, human_signed};
+use crate::cli::{Config, Group};
+use crate::format::{duration_str, headroom_str, human, human_signed, sparkline};
 use crate::kernel::VmStats;
-use crate::sample::Proc;
+use crate::sample::{Proc, StartTime};
 use tree::treeify;
 
 /// A metric column. Each mode carries its own set (SNAPSHOT_COLS etc.).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Col {
-    /// tree mode: processes in the subtree
+    /// tree and app modes: processes in the group
     Procs,
     // snapshot
     Cmprs,
@@ -39,6 +40,8 @@ pub enum Col {
     // watch (not --once): footprint trend over the window
     Grew,
     JetsamEta,
+    /// footprint over the window as a sparkline (text only, not in CSV)
+    Spark,
 }
 
 // (column, shown without -x), in display order.
@@ -70,6 +73,7 @@ pub const WATCH_COLS: &[(Col, bool)] = &[
     (Col::DecompGrowth, false),
     (Col::Headroom, false),
     (Col::Grew, true),
+    (Col::Spark, true),
     (Col::JetsamEta, false),
 ];
 
@@ -91,6 +95,7 @@ impl Col {
             Col::Rate => "RATE/s",
             Col::Grew => "GREW%",
             Col::JetsamEta => "JETSAM_IN",
+            Col::Spark => "TREND",
         }
     }
 
@@ -113,6 +118,7 @@ impl Col {
             Col::DecompGrowth => "decompressions_delta",
             Col::Grew => "grew_pct",
             Col::JetsamEta => "jetsam_eta_s",
+            Col::Spark => "trend",
         }
     }
 
@@ -120,7 +126,7 @@ impl Col {
     /// trend columns, where it means "not enough samples" and prints blank.
     pub fn display(self, v: Option<f64>) -> String {
         match (self, v) {
-            (Col::Grew | Col::JetsamEta, None) => String::new(),
+            (Col::Grew | Col::JetsamEta | Col::Spark, None) => String::new(),
             (_, None) => "N/A".to_string(),
             (Col::Headroom, Some(b)) => headroom_str(Some(b as u64)),
             (Col::Procs | Col::Decomp, Some(n)) => format!("{n:.0}"),
@@ -128,16 +134,23 @@ impl Col {
             (Col::Delta | Col::Rate | Col::SwapinsGrowth, Some(b)) => human_signed(b),
             (Col::Grew, Some(pct)) => format!("{pct:.0}%"),
             (Col::JetsamEta, Some(secs)) => duration_str(secs),
+            (Col::Spark, Some(_)) => String::new(),
             (_, Some(b)) => human(b),
         }
     }
 
     /// Whether tree rollup adds this column up; peaks, limits and trends don't.
+    /// TREND does: a group's sparkline is its members' histories added up.
     pub fn sums(self) -> bool {
         !matches!(
             self,
             Col::FootPeak | Col::CmprsPeak | Col::Headroom | Col::Grew | Col::JetsamEta
         )
+    }
+
+    /// Whether CSV carries this column; the sparkline is text only.
+    pub fn in_csv(self) -> bool {
+        self != Col::Spark
     }
 }
 
@@ -188,19 +201,25 @@ fn cell(col: Col, src: &RowSrc) -> Option<f64> {
         }),
         Col::Grew => src.trend.and_then(|t| t.grew_pct),
         Col::JetsamEta => src.trend.and_then(|t| t.eta_secs),
+        Col::Spark => None, // drawn from Row::hist
     }
 }
 
 pub struct Row {
     pub pid: c_int,
     pub ppid: c_int,
+    pub start: Option<StartTime>,
+    /// responsible process, which `--app` groups under
+    pub resp: Option<c_int>,
     pub name: String,
     /// one value per `Layout::cols`
     pub vals: Vec<Option<f64>>,
     /// tree indent level
     pub depth: usize,
-    /// tree mode: values cover the whole subtree
+    /// tree and app modes: values cover the whole group
     pub rollup: bool,
+    /// watch: footprint over the trend window, oldest first, for TREND
+    pub hist: Vec<u64>,
 }
 
 /// The columns a table carries (`cols`: all of the mode's, as CSV prints) and
@@ -214,7 +233,7 @@ impl Layout {
     /// A sort column hidden without -x is shown anyway.
     pub fn new(config: &Config) -> Layout {
         let mut spec = config.mode.cols().to_vec();
-        if config.tree {
+        if config.group != Group::Flat {
             spec.insert(0, (Col::Procs, true));
         }
         let sort_col = match config.sort_by() {
@@ -240,16 +259,22 @@ impl Layout {
         Row {
             pid: src.now.pid,
             ppid: src.now.ppid,
+            start: src.now.start,
+            resp: src.now.resp,
             name: src.now.name.clone(),
             vals: self.cols.iter().map(|&c| cell(c, src)).collect(),
             depth: 0,
             rollup: false,
+            hist: Vec::new(),
         }
     }
 
     /// Text of column `i` for `row`: blank where a rollup can't add up.
     pub fn text(&self, row: &Row, i: usize) -> Option<String> {
         let col = self.cols[i];
+        if col == Col::Spark {
+            return Some(sparkline(&row.hist));
+        }
         (!row.rollup || col.sums()).then(|| col.display(row.vals[i]))
     }
 }
@@ -292,19 +317,40 @@ fn row_order(layout: &Layout, by: SortBy) -> impl Fn(&Row, &Row) -> Ordering {
     }
 }
 
-/// Sorts rows (tree mode: nests and rolls them up) and applies N. Returns the
-/// rows to show and, in tree mode, how many trees they form.
-pub fn arrange(mut rows: Vec<Row>, layout: &Layout, config: &Config) -> (Vec<Row>, Option<usize>) {
+/// Sorts rows; in tree and app modes, nests and rolls them up. Every row is
+/// kept: `cut` takes the top N to show.
+pub fn arrange(mut rows: Vec<Row>, layout: &Layout, config: &Config) -> Vec<Row> {
     let order = row_order(layout, config.sort_by());
-    if config.tree {
-        let (rows, trees) = treeify(rows, layout, &order, config.topn);
-        return (rows, Some(trees));
+    match config.group {
+        Group::Flat => {
+            rows.sort_by(&order);
+            rows
+        }
+        Group::Tree => treeify(rows, layout, &order, false),
+        Group::App => treeify(rows, layout, &order, true),
     }
-    rows.sort_by(&order);
-    if config.topn > 0 {
-        rows.truncate(config.topn);
+}
+
+/// The first `topn` rows (0 = all); nested rows go with their top-level row,
+/// so in tree and app modes it keeps `topn` whole groups.
+pub fn cut(mut rows: Vec<Row>, topn: usize) -> Vec<Row> {
+    if topn > 0 {
+        let mut top = 0;
+        let end = rows
+            .iter()
+            .position(|r| {
+                top += usize::from(r.depth == 0);
+                top > topn
+            })
+            .unwrap_or(rows.len());
+        rows.truncate(end);
     }
-    (rows, None)
+    rows
+}
+
+/// How many groups (top-level rows) `rows` holds.
+pub fn groups(rows: &[Row]) -> usize {
+    rows.iter().filter(|r| r.depth == 0).count()
 }
 
 /// Sum of `col` over top-level rows (tree mode: over the shown trees).
@@ -327,7 +373,7 @@ fn sum_opt(a: Option<f64>, b: Option<f64>) -> Option<f64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -339,14 +385,17 @@ mod tests {
         assert_eq!(v, vec![Some(5.0), Some(1.0), Some(0.0), None]);
     }
 
-    pub(super) fn row(pid: c_int, ppid: c_int, vals: &[Option<f64>]) -> Row {
+    pub(crate) fn row(pid: c_int, ppid: c_int, vals: &[Option<f64>]) -> Row {
         Row {
             pid,
             ppid,
+            start: Some((pid as u64, 0)),
+            resp: None,
             name: format!("p{pid}"),
             vals: vals.to_vec(),
             depth: 0,
             rollup: false,
+            hist: Vec::new(),
         }
     }
 
@@ -359,5 +408,22 @@ mod tests {
         assert_eq!(Col::DecompGrowth.display(Some(3.0)), "+3");
         assert_eq!(Col::Delta.display(Some(1024.0)), "+1.00K");
         assert_eq!(Col::JetsamEta.display(Some(150.0)), "2m30s");
+        assert_eq!(Col::Spark.display(None), "");
+    }
+
+    #[test]
+    fn test_cut_keeps_whole_groups() {
+        let mut rows: Vec<Row> = [(1, 0), (2, 1), (3, 1), (4, 0), (5, 0)]
+            .iter()
+            .map(|&(pid, depth)| {
+                let mut r = row(pid, 0, &[]);
+                r.depth = depth;
+                r
+            })
+            .collect();
+        assert_eq!(groups(&rows), 3);
+        rows = cut(rows, 2);
+        assert_eq!(rows.iter().map(|r| r.pid).collect::<Vec<_>>(), [1, 2, 3, 4]);
+        assert_eq!(cut(rows, 0).len(), 4);
     }
 }

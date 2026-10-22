@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --release --all-targets --locked -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --release --locked
+
+      - name: Smoke test
+        # Runs every mode against the runner's own processes (no sudo). Under
+        # pipefail, `|| true` keeps head's SIGPIPE from failing the step.
+        run: |
+          bin=target/release/macswapi
+          $bin 5
+          $bin 5 -a
+          $bin 5 -t -x
+          ($bin 3 --csv || true) | head -n 1 | grep -q '^pid,ppid,name,cmprs,'
+          $bin --once 1 > /dev/null
+          $bin --pid $$ > /dev/null
+          $bin -T 1 | grep -q '^macswapi top · '
+          lines=$( ($bin 3 -w 1 --csv || true) | head -n 7 | wc -l)
+          test "$lines" -eq 7
+          set +e
+          $bin -w 1 --alert 'pressure>=normal' --exit-on-alert > /dev/null
+          status=$?
+          set -e
+          test "$status" -eq 3
+          set +e
+          $bin -T 1 --alert 'pressure>=normal' --exit-on-alert > /dev/null
+          status=$?
+          set -e
+          test "$status" -eq 3
+          if $bin --sort bogus 2> /dev/null; then exit 1; fi
+
+      - name: Completions and scripts
+        run: |
+          brew install fish shellcheck
+          bin=target/release/macswapi
+          $bin --completions zsh > _macswapi && zsh -n _macswapi
+          $bin --completions bash > macswapi.bash && bash -n macswapi.bash
+          $bin --completions fish > macswapi.fish && fish -n macswapi.fish
+          shellcheck -s bash macswapi.bash
+          shellcheck install.sh
+
+      - name: install.sh
+        run: |
+          ./install.sh --prefix "$RUNNER_TEMP/pfx"
+          "$RUNNER_TEMP/pfx/bin/macswapi" --help > /dev/null
+          test -f "$RUNNER_TEMP/pfx/share/zsh/site-functions/_macswapi"
+          ./install.sh --prefix "$RUNNER_TEMP/pfx" --uninstall
+          test ! -e "$RUNNER_TEMP/pfx/bin/macswapi"
+
+  msrv:
+    name: Minimum Rust (1.77)
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Rust 1.77
+        run: rustup toolchain install 1.77 --profile minimal
+      - name: Build and test
+        run: rustup run 1.77 cargo test --release --locked
+
+  packaging:
+    name: Formula and plugin manifests
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Homebrew style
+        run: brew style Formula/macswapi.rb
+      - name: JSON manifests parse
+        run: |
+          for f in .claude-plugin/plugin.json .claude-plugin/marketplace.json; do
+            python3 -m json.tool "$f" > /dev/null
+          done

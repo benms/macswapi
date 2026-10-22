@@ -60,6 +60,12 @@ pub fn term_rows() -> Option<usize> {
     (rc == 0 && ws.ws_row > 0).then_some(ws.ws_row as usize)
 }
 
+pub fn term_cols() -> Option<usize> {
+    let mut ws = WinSize::default();
+    let rc = unsafe { ioctl(1, TIOCGWINSZ, &mut ws as *mut WinSize) };
+    (rc == 0 && ws.ws_col > 0).then_some(ws.ws_col as usize)
+}
+
 /// The next key pressed within `timeout_ms`, if any.
 pub fn wait_key(timeout_ms: c_int) -> Option<u8> {
     let mut fd = PollFd {
