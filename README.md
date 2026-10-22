@@ -9,6 +9,11 @@ Prints, per process:
 - **exact** bytes swapped in over the process lifetime
 - with `-x`: lifetime peaks, decompression count, and jetsam-limit headroom
 
+plus a system memory summary on top, and modes in the spirit of Process
+Explorer: a process tree with subtree rollups (`-t`), a live view that flags
+sustained growth (`--live`), a one-process detail page (`--pid`), sorting and
+filtering, and CSV output.
+
 ## Why estimated swap?
 
 **macOS has no per-process swap counter.** The memory compressor packs pages
@@ -78,7 +83,72 @@ earlier struct revision, and fields it lacks print as `N/A`.
 | `HEADROOM` | `limit_bytes_remaining` (rev4) | bytes left before the jetsam memory limit; `-` = none (see caveats) |
 
 Watch mode with `-x` adds `DECOMP` growth and the current `HEADROOM`, so a
-leaking process can be checked against its limit.
+leaking process can be checked against its limit. Sorting by a column that `-x`
+would add (`--sort headroom`) shows that column without `-x`.
+
+## Modes
+
+**Snapshot** (default): the table above, sorted by `CMPRS`. A summary header
+comes first, from `host_statistics64` and sysctls:
+
+```
+memory 32.00G: wired 2.84G  active 11.22G  inactive 10.93G  free 1.33G
+compressor 4.82G holding 9.01G (1.87x)  pressure normal (memorystatus level 75%)
+swap 0B used of 0B (encrypted), 0 compressor pages in swap  since boot: swapped in 0B, out 0B
+```
+
+The compressor ratio (uncompressed data held ÷ space it occupies) is a
+system-wide average; the SWAP~ estimate implicitly gives every process this one
+ratio (see caveats).
+
+**Watch** (`-w`/`--delta [SECS]`): two samples SECS apart (default 3), sorted by
+footprint growth. Adds a line of system rates over the interval, the bytes
+swapped in during it, and which processes started or exited (a reused PID is
+one of each).
+
+**Live** (`-l`/`--live [SECS]`): watch, refreshed every SECS (default 2) until
+`q` or Ctrl-C; space pauses. Two more columns track the last 10 intervals:
+
+| column | meaning |
+|---|---|
+| `GREW%` | share of those intervals in which `FOOTPRINT` grew (blank until 3); rows at 100% are yellow on a color terminal |
+| `JETSAM_IN` | with `-x`: time until `HEADROOM` runs out at the window's average growth rate |
+
+On a terminal it draws in place on the alternate screen and leaves the last
+frame behind on exit; piped, it appends one frame per refresh.
+
+**Detail** (`--pid PID`): everything readable about one process: the full
+`task_vm_info` breakdown with peaks, the purgeable and network/media/graphics/neural
+ledgers, its SWAP~ share, fault and thread counts (`PROC_PIDTASKINFO`), and
+wired memory and disk I/O (`proc_pid_rusage`).
+
+### Tree (`-t`)
+
+Rows nest under their parent process, and each row's values cover its whole
+subtree, like `du`: Chrome's line holds all of its helpers, and `PROCS` counts
+them. Children of launchd (pid 1) are the roots, since rolling everything into
+launchd would hide every app. `N` keeps the top N trees, each shown in full.
+Peaks, `HEADROOM`, and the live trend columns don't add up, so they are blank on
+rows that have children.
+
+### Sort and filter
+
+- `--sort KEY` — snapshot: `cmprs` (default) `swap` `foot` `swapins` `peak`
+  `cpeak` `decomp` `headroom`; watch/live: `delta` (default) `foot` `swapins`
+  `decomp` `headroom`, live also `grew`; any mode: `pid` `name`. Largest first,
+  except `headroom`: smallest first (closest to a kill), processes without a
+  limit last.
+- `--name STR` — names containing STR, any case.
+- `--user USER` — a login name or uid.
+
+Filters pick rows only: the SWAP~ denominator still covers every readable process.
+
+### CSV (`--csv`)
+
+Every column of the mode, whatever `-x` says, as whole numbers (bytes, counts,
+bytes/s); empty means N/A. `headroom` 0 means no limit. With `-t`, a `depth`
+column is added and rows carry subtree totals. No header or footer is printed;
+warnings go to stderr. Not available with `--live`.
 
 ## Install
 
@@ -103,20 +173,35 @@ link time → network-free build.
 ## Usage
 
 ```
-macswapi [N] [-p|--parent] [-x|--extended] [-w|--watch|--delta [SECS]]
+macswapi [N] [options] [-w|--watch|--delta [SECS] | -l|--live [SECS] | --pid PID]
 ```
 
-- `N` — top N rows (default 20, `0` = all)
+- `N` — top N rows (default 20, `0` = all); with `-t`, top N trees
 - `-p`, `--parent` — add PPID + parent-name columns
-- `-x`, `--extended` — add `FOOT_PK`, `CMPRS_PK`, `DECOMP`, `HEADROOM` (watch mode: `DECOMP`, `HEADROOM`)
-- `-w`, `--watch [SECS]`, `--delta [SECS]` — single-interval leak check over a positive interval (default 3s); `N` must appear before the interval flag
+- `-x`, `--extended` — add `FOOT_PK`, `CMPRS_PK`, `DECOMP`, `HEADROOM` (watch: `DECOMP`, `HEADROOM`; live: also `JETSAM_IN`)
+- `-t`, `--tree` — process trees with subtree rollups
+- `--sort KEY`, `--name STR`, `--user USER` — see [Sort and filter](#sort-and-filter)
+- `--csv` — CSV output
+- `-w`, `--watch [SECS]`, `--delta [SECS]` — single-interval leak check (default 3s)
+- `-l`, `--live [SECS]` — refresh every SECS (default 2s)
+- `--pid PID` — one-process detail page
 - `-h`, `--help` — usage
 
+SECS must be positive and immediately follow its flag; `N` must appear before
+the interval flag. `--pid` takes no other mode, `--tree`, `--csv`, `--sort` or
+filter.
+
 ```sh
-./target/release/macswapi 20            # top 20 (own procs without sudo)
-sudo ./target/release/macswapi 20 -p    # system-wide + parents
-sudo ./target/release/macswapi 20 -x    # + peaks, decompressions, jetsam headroom
-sudo ./target/release/macswapi -w 5     # leak watch, 5s
+macswapi 20                         # top 20 (own procs without sudo)
+sudo macswapi 20 -p                 # system-wide + parents
+sudo macswapi 20 -x                 # + peaks, decompressions, jetsam headroom
+sudo macswapi 10 -t                 # top 10 process trees, rolled up
+macswapi --name chrome --sort foot  # Chrome processes by footprint
+macswapi 5 --sort headroom          # closest to a jetsam kill
+sudo macswapi -w 5                  # leak watch, 5s
+macswapi 30 -t --live               # live trees; space pauses, q quits
+macswapi --pid 872                  # everything about one process
+macswapi 0 --csv > procs.csv        # every process, every column
 ```
 
 ## Privileges
@@ -130,6 +215,10 @@ another user's process needs **root**: with `sudo`, every process is read
 
 `task_for_pid` is not used: without root it is refused even for your own
 processes, and under `sudo` it is still refused for SIP-protected ones.
+
+`--pid` on another user's process needs `sudo` too, including for its fault
+counts (`PROC_PIDTASKINFO`) and `proc_pid_rusage`. Without it, `--user root`
+matches nothing, because root's processes can't be read.
 
 ## License
 
