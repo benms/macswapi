@@ -8,7 +8,6 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::io::{BufRead, BufReader, IsTerminal};
 use std::os::raw::{c_char, c_int};
 use std::ptr;
 use std::time::{Duration, Instant};
@@ -584,300 +583,24 @@ fn run_watch(interval: u64, topn: usize, show_parent: bool) {
     );
 }
 
-// ---- log-event history (--logs) -------------------------------------------
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum EventKind {
-    Pressure,
-    Jetsam,
-    Swapfile,
-}
-
-impl EventKind {
-    fn label(self) -> &'static str {
-        match self {
-            EventKind::Pressure => "pressure",
-            EventKind::Jetsam => "jetsam",
-            EventKind::Swapfile => "swapfile",
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct LogEvent {
-    date: String, // "2026-07-15"
-    time: String, // "14:24:01" (milliseconds stripped)
-    kind: EventKind,
-    pid: Option<i32>,        // jetsam only
-    process: Option<String>, // jetsam only
-    message: String,         // raw kernel message
-}
-
-// Coarse filter applied at the `log` layer; classify_event() below is the
-// authoritative typing. Scoped to kernel + the keywords we care about, and the
-// memorystatus branch requires "kill" to skip the flood of benign
-// "memorystatus: Denying dirty-tracking..." / "opted in..." lines.
-// ponytail: kernel-only sender; widen if swapfile events from dynamic_pager/launchd get missed.
-const LOG_PREDICATE: &str = "process == \"kernel\" AND (\
-(eventMessage CONTAINS[c] \"memorystatus\" AND eventMessage CONTAINS[c] \"kill\") OR \
-(eventMessage CONTAINS[c] \"pressure\" AND (eventMessage CONTAINS[c] \"memory\" OR eventMessage CONTAINS[c] \"vm\")) OR \
-eventMessage CONTAINS[c] \"swapfile\" OR \
-eventMessage CONTAINS[c] \"macx_swap\")";
-
-/// Classify a raw kernel message. Order matters: a jetsam kill line may also
-/// mention "pressure", but the kill IS the event.
-fn classify_event(msg: &str) -> Option<EventKind> {
-    let m = msg.to_ascii_lowercase();
-    if m.contains("swapfile") || m.contains("macx_swap") {
-        Some(EventKind::Swapfile)
-    } else if m.contains("memorystatus: killing (idle)") {
-        // The kernel logs each idle kill twice: `killing (idle) NAME [PID] ...`
-        // then `killing_idle_process pid PID [NAME] ...`. Keep only the second,
-        // whose layout extract_jetsam() understands.
-        None
-    } else if m.contains("memorystatus") && m.contains("kill") {
-        Some(EventKind::Jetsam)
-    } else if m.contains("pressure") && (m.contains("memory") || m.contains("vm")) {
-        Some(EventKind::Pressure)
-    } else {
-        None
-    }
-}
-
-/// Best-effort pid + process name from a jetsam message. Formats vary across
-/// macOS versions; we scan for "pid N" / "process N" and the first bracketed
-/// non-numeric token "[Name]". Returns whatever is found (both optional).
-fn extract_jetsam(msg: &str) -> (Option<i32>, Option<String>) {
-    let pid = pid_after_keyword(msg, "pid ")
-        .or_else(|| pid_after_keyword(msg, "process "))
-        .or_else(|| bracketed_number(msg));
-
-    // First "[...]" whose contents are not purely a number → the process name.
-    let mut process = None;
-    let mut rest = msg;
-    while let Some(open) = rest.find('[') {
-        if let Some(close_rel) = rest[open + 1..].find(']') {
-            let inner = &rest[open + 1..open + 1 + close_rel];
-            if !inner.is_empty() && !inner.chars().all(|c| c.is_ascii_digit()) {
-                process = Some(inner.to_string());
-                break;
-            }
-            rest = &rest[open + 1 + close_rel + 1..];
-        } else {
-            break;
-        }
-    }
-    (pid, process)
-}
-
-/// Parse the digits immediately following `keyword` (e.g. "pid ") as an i32.
-fn pid_after_keyword(msg: &str, keyword: &str) -> Option<i32> {
-    let start = msg.find(keyword)? + keyword.len();
-    let digits: String = msg[start..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    digits.parse().ok()
-}
-
-/// First "[N]" bracketed pure-number token, as an i32.
-fn bracketed_number(msg: &str) -> Option<i32> {
-    let mut rest = msg;
-    while let Some(open) = rest.find('[') {
-        let close_rel = rest[open + 1..].find(']')?;
-        let inner = &rest[open + 1..open + 1 + close_rel];
-        if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) {
-            return inner.parse().ok();
-        }
-        rest = &rest[open + 1 + close_rel + 1..];
-    }
-    None
-}
-
-/// Parse one `log show --style compact` line into a LogEvent, or None for the
-/// header, blank lines, and messages that don't classify.
-///
-/// Compact line: `2026-07-15 14:24:01.804 Df kernel[0:9a59c] <message...>`
-/// timestamp = first two whitespace tokens; message = text after the first `]`
-/// (which closes the `process[pid:tid]` field).
-fn parse_compact_line(line: &str) -> Option<LogEvent> {
-    if line.is_empty() || line.starts_with("Timestamp") {
-        return None;
-    }
-    let mut tokens = line.splitn(3, char::is_whitespace);
-    let date = tokens.next()?;
-    let time_full = tokens.next()?;
-    let remainder = tokens.next()?;
-
-    // message begins after the first ']' (end of process[pid:tid]).
-    let close = remainder.find(']')?;
-    let message = remainder[close + 1..].trim();
-    if message.is_empty() {
-        return None;
-    }
-
-    let kind = classify_event(message)?;
-    let (pid, process) = if kind == EventKind::Jetsam {
-        extract_jetsam(message)
-    } else {
-        (None, None)
-    };
-
-    // Sanity-check the timestamp shape without a date library.
-    if date.len() != 10 || !date.as_bytes()[4].eq(&b'-') {
-        return None;
-    }
-    let time = time_full.split('.').next().unwrap_or(time_full);
-
-    Some(LogEvent {
-        date: date.to_string(),
-        time: time.to_string(),
-        kind,
-        pid,
-        process,
-        message: message.to_string(),
-    })
-}
-
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-fn event_json(e: &LogEvent) -> String {
-    let mut fields = vec![
-        format!("\"time\": \"{} {}\"", e.date, json_escape(&e.time)),
-        format!("\"type\": \"{}\"", e.kind.label()),
-    ];
-    if let Some(pid) = e.pid {
-        fields.push(format!("\"pid\": {pid}"));
-    }
-    if let Some(p) = &e.process {
-        fields.push(format!("\"process\": \"{}\"", json_escape(p)));
-    }
-    fields.push(format!("\"message\": \"{}\"", json_escape(&e.message)));
-    format!("{{{}}}", fields.join(", "))
-}
-
-/// Spawns `log show` with its stdout piped to us; its stderr passes through.
-fn spawn_log_show(hours: u64) -> std::io::Result<std::process::Child> {
-    std::process::Command::new("/usr/bin/log")
-        .args([
-            "show",
-            "--last",
-            &format!("{hours}h"),
-            "--style",
-            "compact",
-            "--predicate",
-            LOG_PREDICATE,
-        ])
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-}
-
-/// Returns the process exit code. Text events print as `log show` emits them,
-/// since a long query can take minutes; JSON prints once the query finishes.
-fn run_logs(hours: u64, format: OutputFormat) -> i32 {
-    if std::io::stderr().is_terminal() {
-        eprintln!("querying unified log for the last {hours}h (can take minutes)…");
-    }
-    let mut child = match spawn_log_show(hours) {
-        Ok(child) => child,
-        Err(e) => {
-            eprintln!("could not run /usr/bin/log: {e}");
-            return 1;
-        }
-    };
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let events = BufReader::new(stdout)
-        .split(b'\n')
-        .map_while(Result::ok)
-        .filter_map(|line| parse_compact_line(&String::from_utf8_lossy(&line)));
-
-    let mut json_items: Vec<String> = Vec::new();
-    let mut count = 0usize;
-    let mut prev_date: Option<String> = None;
-    for e in events {
-        count += 1;
-        match format {
-            OutputFormat::Json => json_items.push(event_json(&e)),
-            OutputFormat::Text => {
-                if count == 1 {
-                    println!("{:<9} {:<9} DETAIL", "TIME", "TYPE");
-                }
-                if prev_date.as_deref() != Some(e.date.as_str()) {
-                    println!("-- {} --", e.date);
-                    prev_date = Some(e.date.clone());
-                }
-                println!("{:<9} {:<9} {}", e.time, e.kind.label(), e.message);
-            }
-        }
-    }
-
-    match child.wait() {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            eprintln!("log show failed ({status})");
-            return 1;
-        }
-        Err(e) => {
-            eprintln!("could not wait for /usr/bin/log: {e}");
-            return 1;
-        }
-    }
-    match format {
-        OutputFormat::Json => println!("[{}]", json_items.join(", ")),
-        OutputFormat::Text if count == 0 => {
-            let unit = if hours == 1 { "hour" } else { "hours" };
-            println!("no memory events in last {hours} {unit}");
-        }
-        OutputFormat::Text => {}
-    }
-    0
-}
-
 // ---- CLI ------------------------------------------------------------------
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum OutputFormat {
-    Text,
-    Json,
-}
 
 #[derive(Debug, PartialEq, Eq)]
 struct Config {
     topn: usize,
     show_parent: bool,
     watch_secs: Option<u64>,
-    logs_hours: Option<u64>,
-    format: OutputFormat,
     help: bool,
 }
 
 const USAGE: &str = "\
 macswapi [N] [-p|--parent] [-w|--watch|--delta [SECS]]
-macswapi -l|--logs [HOURS] [-f|--format text|json]
   N            top N rows (default 20, 0=all)
   -p --parent  add PPID + parent-name columns (works in watch mode too)
   -w --watch   single-interval leak check; SECS must immediately follow the flag
      --delta   clearer alias for --watch (default interval 3s)
                SECS must be positive; N must appear before the interval flag
                example: macswapi 50 --delta 5
-  -l --logs    memory-event timeline from the unified log (default 1 hour)
-               events: memory-pressure changes, jetsam kills, swapfile lifecycle
-               HOURS must be positive and immediately follow the flag
-  -f --format  output format for --logs: text (default) or json
   -h --help    this help
 ";
 
@@ -886,13 +609,9 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         topn: 20,
         show_parent: false,
         watch_secs: None,
-        logs_hours: None,
-        format: OutputFormat::Text,
         help: false,
     };
     let mut saw_interval_flag = false;
-    let mut saw_format_flag = false;
-    let mut saw_topn = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -919,56 +638,18 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
                     }
                 }
             }
-            "-l" | "--logs" => {
-                if config.logs_hours.is_some() {
-                    return Err("duplicate --logs flag".to_string());
-                }
-                config.logs_hours = Some(1);
-                if i + 1 < args.len() {
-                    if let Ok(hours) = args[i + 1].parse::<u64>() {
-                        if hours == 0 {
-                            return Err("--logs HOURS must be positive".to_string());
-                        }
-                        config.logs_hours = Some(hours);
-                        i += 1;
-                    }
-                }
-            }
-            "-f" | "--format" => {
-                saw_format_flag = true;
-                match args.get(i + 1).map(String::as_str) {
-                    Some("text") => config.format = OutputFormat::Text,
-                    Some("json") => config.format = OutputFormat::Json,
-                    Some(other) => {
-                        return Err(format!("unknown --format: {other} (want text|json)"))
-                    }
-                    None => return Err("--format needs a value (text|json)".to_string()),
-                }
-                i += 1;
-            }
             other => {
                 if let Ok(topn) = other.parse::<usize>() {
                     if saw_interval_flag {
                         return Err("N must appear before the interval flag".to_string());
                     }
                     config.topn = topn;
-                    saw_topn = true;
                 } else {
                     return Err(format!("unknown arg: {other}"));
                 }
             }
         }
         i += 1;
-    }
-
-    if config.watch_secs.is_some() && config.logs_hours.is_some() {
-        return Err("--logs and --watch are mutually exclusive".to_string());
-    }
-    if saw_format_flag && config.logs_hours.is_none() {
-        return Err("--format only applies to --logs".to_string());
-    }
-    if config.logs_hours.is_some() && (saw_topn || config.show_parent) {
-        return Err("N and --parent do not apply to --logs".to_string());
     }
 
     Ok(config)
@@ -994,9 +675,7 @@ fn main() {
         return;
     }
 
-    if let Some(hours) = config.logs_hours {
-        std::process::exit(run_logs(hours, config.format));
-    } else if let Some(watch_secs) = config.watch_secs {
+    if let Some(watch_secs) = config.watch_secs {
         run_watch(watch_secs, config.topn, config.show_parent);
     } else {
         run_snapshot(config.topn, config.show_parent);
@@ -1085,8 +764,6 @@ mod tests {
                 topn: 20,
                 show_parent: false,
                 watch_secs: Some(5),
-                logs_hours: None,
-                format: OutputFormat::Text,
                 help: false,
             }
         );
@@ -1100,136 +777,6 @@ mod tests {
     #[test]
     fn test_parse_args_rejects_zero_interval() {
         assert!(parse(&["--watch", "0"]).is_err());
-    }
-
-    #[test]
-    fn test_parse_args_logs_defaults_and_hours() {
-        assert_eq!(parse(&["--logs"]).unwrap().logs_hours, Some(1));
-        assert_eq!(parse(&["-l", "4"]).unwrap().logs_hours, Some(4));
-        assert!(parse(&["--logs", "0"]).is_err());
-    }
-
-    #[test]
-    fn test_parse_args_rejects_snapshot_options_with_logs() {
-        assert!(parse(&["5", "--logs"]).is_err());
-        assert!(parse(&["--logs", "4", "10"]).is_err()); // 4 = HOURS, 10 = N
-        assert!(parse(&["--logs", "-p"]).is_err());
-    }
-
-    #[test]
-    fn test_parse_args_format_requires_logs_and_valid_value() {
-        assert_eq!(
-            parse(&["--logs", "-f", "json"]).unwrap().format,
-            OutputFormat::Json
-        );
-        assert!(parse(&["-f", "json"]).is_err()); // --format without --logs
-        assert!(parse(&["--logs", "-f", "yaml"]).is_err()); // bad value
-        assert!(parse(&["--logs", "--format"]).is_err()); // missing value
-        assert!(parse(&["--logs", "--watch", "5"]).is_err()); // mutually exclusive
-    }
-
-    // Real kernel messages captured with `log show --style compact`.
-    // KILL_IDLE_DUP is logged ~15ms before KILL_IDLE for the same kill.
-    const KILL_SPECIFIC: &str = "memorystatus: killing_specific_process pid 58521 \
-        [knowledgeconstructiond] (per-process-limit 0 0s rf:- type:daemon) 20192KB - \
-        memorystatus_available_pages: 1820483";
-    const KILL_IDLE: &str = "memorystatus: killing_idle_process pid 414 [sandboxd] \
-        (idle-exit 0 90330s rf:- type:daemon) 3168KB - memorystatus_available_pages: 789885 \
-        compressor_size:795015";
-    const KILL_IDLE_DUP: &str = "memorystatus: killing (idle) sandboxd [414] due to idle-exit (9)";
-
-    #[test]
-    fn test_classify_event() {
-        assert_eq!(classify_event(KILL_SPECIFIC), Some(EventKind::Jetsam));
-        assert_eq!(classify_event(KILL_IDLE), Some(EventKind::Jetsam));
-        // duplicate of KILL_IDLE: skipped so each kill is reported once
-        assert_eq!(classify_event(KILL_IDLE_DUP), None);
-        // noise: memorystatus but no kill
-        assert_eq!(
-            classify_event("memorystatus: Denying dirty-tracking opt-in for managed VPN [15607]"),
-            None
-        );
-        assert_eq!(
-            classify_event("vm memory pressure level changed to 2"),
-            Some(EventKind::Pressure)
-        );
-        assert_eq!(
-            classify_event("macx_swapon SUCCESS - swapfile /private/var/vm/swapfile1"),
-            Some(EventKind::Swapfile)
-        );
-        // a kill mentioning pressure still classifies as jetsam
-        assert_eq!(
-            classify_event("memorystatus: killing process 5 [App] because of memory pressure"),
-            Some(EventKind::Jetsam)
-        );
-        assert_eq!(classify_event("unrelated kernel chatter"), None);
-    }
-
-    #[test]
-    fn test_extract_jetsam() {
-        assert_eq!(
-            extract_jetsam(KILL_SPECIFIC),
-            (Some(58521), Some("knowledgeconstructiond".to_string()))
-        );
-        assert_eq!(
-            extract_jetsam(KILL_IDLE),
-            (Some(414), Some("sandboxd".to_string()))
-        );
-        // "process N" form, name in brackets, no "pid" token
-        assert_eq!(
-            extract_jetsam("Killing process 1234 [Safari] in high band FOREGROUND"),
-            (Some(1234), Some("Safari".to_string()))
-        );
-        // graceful: unknown shape yields whatever is found
-        assert_eq!(extract_jetsam("killed something"), (None, None));
-    }
-
-    #[test]
-    fn test_parse_compact_line() {
-        let line = format!("2026-10-21 20:09:19.943 Df kernel[0:877] {KILL_IDLE}");
-        let e = parse_compact_line(&line).unwrap();
-        assert_eq!(e.date, "2026-10-21");
-        assert_eq!(e.time, "20:09:19"); // ms stripped
-        assert_eq!(e.kind, EventKind::Jetsam);
-        assert_eq!(e.pid, Some(414));
-        assert_eq!(e.process.as_deref(), Some("sandboxd"));
-        assert_eq!(e.message, KILL_IDLE);
-
-        // the idle-kill duplicate yields no event
-        let dup = format!("2026-10-21 20:09:19.929 Df kernel[0:877] {KILL_IDLE_DUP}");
-        assert!(parse_compact_line(&dup).is_none());
-
-        // header and noise → None
-        assert!(parse_compact_line("Timestamp               Ty Process[PID:TID]").is_none());
-        assert!(parse_compact_line(
-            "2026-07-15 14:24:01.804 Df kernel[0:9a59c] memorystatus: Denying dirty-tracking [15607]"
-        )
-        .is_none());
-        assert!(parse_compact_line("").is_none());
-    }
-
-    #[test]
-    fn test_json_escape() {
-        assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
-        assert_eq!(json_escape("line\nfeed"), "line\\nfeed");
-        assert_eq!(json_escape("\u{1}"), "\\u0001");
-    }
-
-    #[test]
-    fn test_event_json_omits_pid_for_non_jetsam() {
-        let e = LogEvent {
-            date: "2026-07-15".to_string(),
-            time: "14:24:01".to_string(),
-            kind: EventKind::Pressure,
-            pid: None,
-            process: None,
-            message: "memory pressure level 2".to_string(),
-        };
-        let j = event_json(&e);
-        assert!(j.contains("\"type\": \"pressure\""));
-        assert!(j.contains("\"time\": \"2026-07-15 14:24:01\""));
-        assert!(!j.contains("\"pid\""));
-        assert!(!j.contains("\"process\""));
     }
 
     #[test]

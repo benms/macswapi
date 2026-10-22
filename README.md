@@ -76,44 +76,18 @@ link time → network-free build.
 
 ```
 macswapi [N] [-p|--parent] [-w|--watch|--delta [SECS]]
-macswapi -l|--logs [HOURS] [-f|--format text|json]
 ```
 
 - `N` — top N rows (default 20, `0` = all)
 - `-p`, `--parent` — add PPID + parent-name columns
 - `-w`, `--watch [SECS]`, `--delta [SECS]` — single-interval leak check over a positive interval (default 3s); `N` must appear before the interval flag
-- `-l`, `--logs [HOURS]` — memory-event timeline from the unified log (default 1 hour)
-- `-f`, `--format text|json` — output format for `--logs` (default `text`)
 - `-h`, `--help` — usage
 
 ```sh
 ./target/release/macswapi 20            # top 20 (own procs without sudo)
 sudo ./target/release/macswapi 20 -p    # system-wide + parents
 sudo ./target/release/macswapi -w 5     # leak watch, 5s
-./target/release/macswapi -l 24         # memory events, last 24h
-./target/release/macswapi -l 24 -f json # same, as JSON
 ```
-
-### Memory-event history (`--logs`)
-
-macOS can't attribute swap to a PID, but the unified log records swap-*adjacent*
-events. `--logs` runs `log show` and prints a chronological timeline of three
-kernel event types, useful for post-mortems ("why did swap spike at 2pm?"):
-
-| type | what |
-|---|---|
-| `jetsam` | processes the kernel killed under memory pressure (pid + name extracted) |
-| `pressure` | memory-pressure level transitions |
-| `swapfile` | swapfile create/delete — when system-wide swap grew/shrank |
-
-Message parsing is deliberately shallow: lines are classified by keyword and the
-kernel's raw message is passed through, so format drift across macOS versions
-degrades gracefully rather than breaking. JSON output carries extracted `pid`
-and `process` fields for jetsam events. Scoped to kernel-sender messages; some
-swap events logged by other daemons may not appear.
-
-Querying many hours can take minutes (72h took about 5 minutes on one Mac).
-Text output prints events as they arrive; JSON prints when the query finishes.
 
 ## Privileges
 
