@@ -42,6 +42,7 @@ while [ $# -gt 0 ]; do
 done
 
 # The shell doesn't expand ~ in --prefix=~/x; also make the prefix absolute.
+# shellcheck disable=SC2088 # literal "~/" match is intentional
 case $prefix in
     "~") prefix=$HOME ;;
     "~/"*) prefix=$HOME/${prefix#"~/"} ;;
